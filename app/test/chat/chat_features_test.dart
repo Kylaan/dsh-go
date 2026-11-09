@@ -15,7 +15,6 @@ import 'package:dsh_app/state/usage_state.dart';
 import 'package:dsh_app/ui/chat/chat_screen.dart';
 import 'package:dsh_app/ui/chat/diff_page.dart';
 import 'package:dsh_app/ui/chat/empty_state.dart';
-import 'package:dsh_app/ui/chat/model_sheet.dart';
 import 'package:dsh_app/ui/chat/slash_palette.dart';
 import 'package:dsh_app/ui/chat/turn_summary.dart';
 import 'package:dsh_app/ui/chat/usage_sheet.dart';
@@ -27,6 +26,7 @@ import 'package:dsh_app/ui/chat/widgets/whale_tail.dart';
 import 'package:dsh_app/ui/theme/app_icons.dart';
 import 'package:dsh_app/ui/theme/theme.dart';
 import 'package:dsh_client/dsh_client.dart';
+import 'package:dsh_app/ui/chat/model_sheet.dart' show ModelChip;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -278,6 +278,54 @@ void main() {
       expect(chat.sent, ['/sdcard/notes.txt 总结一下']);
     });
 
+    testWidgets('inserting a leading slash opens the palette and keeps the existing draft', (tester) async {
+      final harness = _changesHarness();
+      await pumpChat(tester, harness);
+      final field = find.byType(TextField);
+      final controller = tester.widget<TextField>(field).controller!;
+      controller.value = const TextEditingValue(text: '/已有文字', selection: TextSelection.collapsed(offset: 1));
+      await pumpFrames(tester, 3);
+      final palette = find.byType(SlashPalette);
+      expect(palette, findsOneWidget);
+      await tester.tap(find.descendant(of: palette, matching: find.textContaining('/permission')).first);
+      await pumpFrames(tester, 3);
+      expect(controller.text, '/permission 已有文字');
+      expect(harness.controllers['s1']!.commandLines, isEmpty);
+      expect(harness.controllers['s1']!.sent, isEmpty);
+
+      // A command that normally runs immediately must also retain the draft
+      // until the user explicitly sends it.
+      controller.value = const TextEditingValue(text: '  /已有文字', selection: TextSelection.collapsed(offset: 3));
+      await pumpFrames(tester, 3);
+      await tester.tap(find.descendant(of: palette, matching: find.textContaining('/compact')).first);
+      await pumpFrames(tester, 3);
+      expect(controller.text, '  /compact 已有文字');
+      expect(harness.controllers['s1']!.commandLines, isEmpty);
+
+      // Completing inside a known name replaces it without duplicating its
+      // unselected suffix or discarding the arguments.
+      controller.value = const TextEditingValue(
+        text: '/permission read-only',
+        selection: TextSelection.collapsed(offset: 4),
+      );
+      await pumpFrames(tester, 3);
+      await tester.tap(find.descendant(of: palette, matching: find.textContaining('/permission')).first);
+      await pumpFrames(tester, 3);
+      expect(controller.text, '/permission read-only');
+
+      controller.value = const TextEditingValue(text: 'hello /', selection: TextSelection.collapsed(offset: 7));
+      await pumpFrames(tester, 3);
+      expect(palette, findsNothing);
+
+      // Sending still resolves the complete command line, independent of
+      // where the cursor was left while editing it.
+      controller.value = const TextEditingValue(text: '/comp', selection: TextSelection.collapsed(offset: 0));
+      await tester.tap(find.byIcon(AppIcons.send));
+      await pumpFrames(tester, 3);
+      expect(harness.controllers['s1']!.commandLines, ['/compact']);
+      expect(controller.text, isEmpty);
+    });
+
     testWidgets('/model opens the model sheet, /new starts a new chat', (tester) async {
       final harness = _changesHarness();
       await pumpChat(tester, harness);
@@ -319,7 +367,7 @@ void main() {
       await pumpFrames(tester, 8);
       expect(find.text('用量'), findsOneWidget);
       expect(find.text('6%'), findsNWidgets(2)); // the ring and the sheet
-      expect(find.text('7.1 万'), findsOneWidget); // input incl. cache
+      expect(find.text('71K'), findsOneWidget); // input incl. cache
       expect(find.text('74%'), findsOneWidget); // cache hit rate
       expect(find.text('¥110.00'), findsOneWidget);
       expect(harness.balanceRequests, [testKey], reason: 'throttled');
@@ -341,8 +389,12 @@ void main() {
         catalog: ModelCatalog.fromJson(const {'groups': <Object?>[]}),
       );
       await pumpChat(tester, harness);
-      expect(find.text('选择模型'), findsOneWidget);
-      await tester.tap(find.byType(ModelChip));
+      // The new chat's header chip (and the composer's, once typing) asks for one.
+      expect(find.descendant(of: find.byType(ModelChip), matching: find.text('选择模型')), findsOneWidget);
+      await tester.tap(find.byType(TextField));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+      await tester.tap(find.byKey(const ValueKey('composer-model')));
       await pumpFrames(tester, 8);
       expect(find.text('需要 API Key'), findsOneWidget);
       expect(find.text('填写 API Key'), findsOneWidget);
@@ -404,7 +456,10 @@ void main() {
 
       testWidgets('model sheet', (tester) async {
         await pumpChat(tester, ChatHarness(), brightness: brightness);
-        await tester.tap(find.byType(ModelChip));
+        await tester.tap(find.byType(TextField));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+        await tester.tap(find.byKey(const ValueKey('composer-model')));
         await pumpFrames(tester, 10);
         await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/model_sheet_$suffix.png'));
       });
@@ -418,7 +473,10 @@ void main() {
           ),
           brightness: brightness,
         );
-        await tester.tap(find.byType(ModelChip));
+        await tester.tap(find.byType(TextField));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 500));
+        await tester.tap(find.byKey(const ValueKey('composer-model')));
         await pumpFrames(tester, 10);
         await expectLater(find.byType(MaterialApp), matchesGoldenFile('goldens/model_empty_$suffix.png'));
       });

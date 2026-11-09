@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../l10n/l10n.dart';
 import 'connection_state.dart';
+import 'engine_error_text.dart';
 import 'models_state.dart';
 import 'providers_state.dart';
 import 'read_list_epoch.dart';
@@ -23,7 +24,13 @@ String subscriptionLabel(Subscription s) => switch (s) {
 String describeLoginError(Object error) {
   if (error is DshRemoteException) {
     final code = error.code;
-    if (code.startsWith('gateway/') && code != 'gateway/internal') return appL10n.stateSubscriptionUnsupported;
+    if (code == 'gateway/method-not-found' || code == 'gateway/not-found') {
+      return appL10n.stateSubscriptionUnsupported;
+    }
+    if (error.isGatewayError) {
+      final reason = engineErrorReason(error);
+      if (reason != null) return reason;
+    }
     if (error.message.contains('could not reach') || error.message.contains('fetch failed')) {
       return appL10n.stateSubscriptionUnreachable;
     }
@@ -120,13 +127,29 @@ void refreshAfterSubscriptionChange(WidgetRef ref) {
   ref.invalidate(modelCatalogProvider);
 }
 
+/// 订阅在 pi-ai 里的 route profile（`providers.openai-codex` 之类），
+/// 模型覆盖（上下文长度）从这里读写。未连接 / 引擎没挂 pi-ai / 桥还没声明
+/// route 时为 null。
+final subscriptionProfileProvider = FutureProvider.autoDispose.family<ProviderProfile?, Subscription>((
+  ref,
+  subscription,
+) async {
+  final backend = ref.watch(providerBackendProvider);
+  if (backend == null) return null;
+  final sub = backend.changes.listen((_) => ref.invalidateSelf());
+  ref.onDispose(() => unawaited(sub.cancel()));
+  final settings = await backend.read();
+  return settings?.byRoute(subscription.wire);
+});
+
 /// One sign-in attempt, polled about once a second while its sheet is open.
 ///
 /// ```
 /// start → begin → poll … open | device | prompt … → done | failed | cancelled
 /// ```
 ///
-/// [close] stops polling and cancels an attempt that has not finished.
+/// [close] stops polling and requests cancellation unless the engine has
+/// reported the attempt finished.
 class LoginSession extends ChangeNotifier {
   LoginSession(this.backend, this.subscription, {this.interval = const Duration(seconds: 1)});
 
@@ -137,6 +160,7 @@ class LoginSession extends ChangeNotifier {
   LoginStep _step = const LoginStep(phase: LoginPhase.starting);
   LoginStep get step => _step;
 
+  // A known attempt that the engine has not reported as finished.
   String? _attemptId;
   Timer? _timer;
   bool _closed = false;
@@ -160,7 +184,7 @@ class LoginSession extends ChangeNotifier {
     final previous = _attemptId;
     _attemptId = null;
     _misses = 0;
-    if (previous != null && !_step.phase.finished) unawaited(backend.cancel(previous).catchError((_) {}));
+    if (previous != null) unawaited(backend.cancel(previous).catchError((_) {}));
     _set(const LoginStep(phase: LoginPhase.starting));
     try {
       final id = await backend.begin(subscription);
@@ -183,6 +207,7 @@ class LoginSession extends ChangeNotifier {
       final next = await backend.poll(id);
       if (_closed || id != _attemptId) return;
       _misses = 0;
+      if (next.phase.finished) _attemptId = null;
       _set(next);
       if (next.phase.finished) return;
     } catch (error) {
@@ -192,6 +217,8 @@ class LoginSession extends ChangeNotifier {
         return;
       }
     }
+    // An answer may have started another poll while this one was in flight.
+    _timer?.cancel();
     _timer = Timer(interval, () => unawaited(_poll()));
   }
 
@@ -215,13 +242,13 @@ class LoginSession extends ChangeNotifier {
     await _poll();
   }
 
-  /// Stops polling; an unfinished attempt is cancelled on the engine.
+  /// Stops polling and asks the engine to cancel an attempt not known to have finished.
   void close() {
     if (_closed) return;
     _closed = true;
     _timer?.cancel();
     final id = _attemptId;
-    if (id != null && !_step.phase.finished) unawaited(backend.cancel(id).catchError((_) {}));
+    if (id != null) unawaited(backend.cancel(id).catchError((_) {}));
   }
 
   @override

@@ -169,7 +169,9 @@ class ChatNotifier(private val app: Context) {
         unlockReceiver = receiver
         val filter = IntentFilter(Intent.ACTION_USER_PRESENT)
         if (Build.VERSION.SDK_INT >= 33) {
-            app.applicationContext.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+            // SystemUI may use its own UID. USER_PRESENT is protected: only the
+            // system can send it, so exporting this single-action receiver is safe.
+            app.applicationContext.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED)
         } else {
             app.applicationContext.registerReceiver(receiver, filter)
         }
@@ -263,7 +265,7 @@ class ChatNotifier(private val app: Context) {
         val summary = Notification.Builder(app, channel)
             .setSmallIcon(R.drawable.ic_stat_dsh)
             .setColor(ThemeAccent.notificationColor(app))
-            .setContentTitle(title)
+            .setContentTitle(if (keyguard.isKeyguardLocked) AppStrings.APP_NAME else title)
             .setContentText(AppStrings.plural(app, R.plurals.notify_reminder_count, count, count))
             .setGroup(tag)
             .setGroupSummary(true)
@@ -276,22 +278,30 @@ class ChatNotifier(private val app: Context) {
         nm.notify(tag, SUMMARY_ID, summary)
     }
 
-    private fun openIntent(post: Post, tag: String, id: Int): PendingIntent {
+    private fun openIntent(post: Post, tag: String, id: Int): PendingIntent =
+        sessionIntent(post.sessionId, post.host, post.kind, post.eventId, 31 * tag.hashCode() + id)
+
+    /**
+     * A tap that opens [sessionId] on [host], the way a chat notification's does (it carries the
+     * secret [takeTap] checks). Full route data distinguishes PendingIntents even when their
+     * [requestCode] hashes collide; extras alone do not participate in identity.
+     */
+    fun sessionIntent(sessionId: String, host: String, kind: String, eventId: String?, requestCode: Int): PendingIntent {
         val intent = Intent(app, MainActivity::class.java)
             .setAction(ACTION_OPEN)
+            .setData(Uri.Builder().scheme("dsh-notify").authority("open")
+                .appendQueryParameter("host", host)
+                .appendQueryParameter("session", sessionId)
+                .appendQueryParameter("kind", kind)
+                .apply { if (eventId != null) appendQueryParameter("event", eventId) }
+                .build())
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
             .putExtra(EXTRA_TOKEN, token())
-            .putExtra(EXTRA_SESSION, post.sessionId)
-            .putExtra(EXTRA_HOST, post.host)
-            .putExtra(EXTRA_KIND, post.kind)
-            .putExtra(EXTRA_EVENT, post.eventId)
-        // Extras don't make PendingIntents distinct: one request code per notification does.
-        return PendingIntent.getActivity(
-            app,
-            31 * tag.hashCode() + id,
-            intent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+            .putExtra(EXTRA_SESSION, sessionId)
+            .putExtra(EXTRA_HOST, host)
+            .putExtra(EXTRA_KIND, kind)
+            .putExtra(EXTRA_EVENT, eventId)
+        return PendingIntent.getActivity(app, requestCode, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
     private fun actionIntent(post: Post, decision: String): PendingIntent {
@@ -349,7 +359,7 @@ class ChatNotifier(private val app: Context) {
         val builder = Notification.Builder(app, CHANNEL_ATTENTION)
             .setSmallIcon(R.drawable.ic_stat_dsh)
             .setColor(ThemeAccent.notificationColor(app))
-            .setContentTitle(post?.title ?: AppStrings.APP_NAME)
+            .setContentTitle(if (keyguard.isKeyguardLocked) AppStrings.APP_NAME else post?.title ?: AppStrings.APP_NAME)
             .setContentText(text)
             .setOnlyAlertOnce(true)
             .setAutoCancel(true)
@@ -361,13 +371,13 @@ class ChatNotifier(private val app: Context) {
     }
 
     /** Per-install secret proving a launch intent came from our own PendingIntent. */
-    private fun token(): String {
+    private fun token(): String = synchronized(tokenLock) {
         val prefs = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        prefs.getString(PREF_TOKEN, null)?.let { return it }
+        prefs.getString(PREF_TOKEN, null)?.let { return@synchronized it }
         val bytes = ByteArray(16).also { SecureRandom().nextBytes(it) }
         val fresh = bytes.joinToString("") { "%02x".format(it) }
         prefs.edit().putString(PREF_TOKEN, fresh).apply()
-        return fresh
+        fresh
     }
 
     companion object {
@@ -394,6 +404,8 @@ class ChatNotifier(private val app: Context) {
         private const val EXTRA_EVENT = "dsh.notify.event"
         private const val PREFS = "dsh_notify"
         private const val PREF_TOKEN = "tap_token"
+        // The UI notifier and dsh-live worker create different ChatNotifier instances.
+        private val tokenLock = Any()
 
         /**
          * Per group: the conversation title and channel its summary uses (latest child wins).

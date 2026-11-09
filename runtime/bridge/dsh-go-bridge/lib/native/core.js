@@ -5,19 +5,20 @@ import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
 import { dirname, isAbsolute, join } from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { ID, LIMITS, PKG, PROTOCOL, TONES, ICON } from "./limits.js";
 import { parseManifest, renderPlugin } from "./manifest.js";
 import {
   call, chars, cleanLine, compareSemver, deepEqual, errorText, isPlainObject, mergeApply, mergeDiff,
-  normalizeScope, scopeMatches, shortHash, toJson, truncateChars, withoutNulls,
+  normalizeScope, sanitizeNotes, scopeMatches, shortHash, toJson, truncateChars, withoutNulls,
 } from "./util.js";
 
 const TRACKER = Symbol.for("cordis.tracker");
 const SCAN_MAX_AGE_MS = 2000;
 const CHANGED_DEBOUNCE_MS = 300;
 const SELF = "dsh-go-bridge";
-const REG_NAMES = { panels: "panel", strips: "strip", handlers: "on", media: "media", micro: "micro", capability: "onCapability" };
+const REG_NAMES = { panels: "panel", strips: "strip", notes: "turnNote", handlers: "on", media: "media", micro: "micro", capability: "onCapability" };
 
 /** Loader entry owning a fiber (walks up through `ctx.inject` sub-fibers). */
 export function entryOf(fiber) {
@@ -198,6 +199,7 @@ export class NativeCore {
     return {
       panels,
       strips: new Set(regs?.strips.keys() ?? []),
+      notes: new Set(regs?.notes.keys() ?? []),
       handlers: new Set(regs?.handlers.keys() ?? []),
       degraded: h?.degraded === true,
       runtimeIssues: [...(h?.issues.values() ?? [])],
@@ -315,7 +317,7 @@ export class NativeCore {
 
   /** Token bucket + concurrency per plugin; returns a release function or undefined (429). */
   admitInvoke(pkg) {
-    const now = Date.now();
+    const now = performance.now();
     let b = this.buckets.get(pkg);
     if (b === undefined) {
       b = { tokens: LIMITS.invokeBurst, at: now, inflight: 0 };
@@ -359,9 +361,9 @@ export class NativeCore {
       if (def.data !== undefined && typeof def.data !== "function") throw new TypeError("dshGo.panel: data must be a function (scope, emit) => cancel");
       if (def.actions !== undefined && (!isPlainObject(def.actions) || Object.values(def.actions).some((f) => typeof f !== "function"))) throw new TypeError("dshGo.panel: actions must map names to functions");
       value = { view: def.view, data: def.data, actions: def.actions };
-    } else if (kind === "strips" || kind === "micro") {
+    } else if (kind === "strips" || kind === "micro" || kind === "notes") {
       const data = typeof def === "function" ? def : def?.data;
-      if (typeof data !== "function") throw new TypeError(`dshGo.${kind === "micro" ? "micro" : "strip"}: pass (scope, emit) => cancel or { data }`);
+      if (typeof data !== "function") throw new TypeError(`dshGo.${REG_NAMES[kind]}: pass (scope, emit) => cancel or { data }`);
       value = { data };
     } else {
       if (typeof def !== "function") throw new TypeError(`dshGo.${REG_NAMES[kind]}: handler must be a function`);
@@ -377,20 +379,20 @@ export class NativeCore {
   #add(pkg, kind, id, def, token) {
     let regs = this.regs.get(pkg);
     if (regs === undefined) {
-      regs = { panels: new Map(), strips: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map() };
+      regs = { panels: new Map(), strips: new Map(), notes: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map() };
       this.regs.set(pkg, regs);
     }
     const count = Object.values(regs).reduce((n, entries) => n + entries.size, 0);
     if (count === 0) this.#resetHealth(pkg);
     const replaced = regs[kind].has(id);
     regs[kind].set(id, { def, token });
-    if (replaced && (kind === "panels" || kind === "strips")) for (const feed of [...this.feeds.values()]) if (feed.pkg === pkg && feed.id === id) feed.stop("not-found");
+    if (replaced && (kind === "panels" || kind === "strips" || kind === "notes")) for (const feed of [...this.feeds.values()]) if (feed.pkg === pkg && feed.id === id) feed.stop("not-found");
     const rec = this.plugin(pkg);
     const declared = rec?.parsed.ids.get(id);
     const ok = kind === "capability" ? (rec?.parsed.capabilities?.length ?? 0) > 0
       : kind === "media" || kind === "micro" ? declared === kind
       : kind === "handlers" ? declared !== undefined
-      : kind === "panels" ? declared === "panels" : declared === "composer.strip";
+      : kind === "panels" ? declared === "panels" : kind === "notes" ? declared === "turn.note" : declared === "composer.strip";
     if (!ok) {
       const what = kind === "capability" ? "onCapability() needs dshGo.capabilities" : `${REG_NAMES[kind]}("${id}") is not declared in dshGo.contributes`;
       this.runtimeIssue(pkg, `undeclared:${kind}:${id}`, { path: `/runtime/${id}`, code: "undeclared", severity: "warn", message: `${what}; ignored` });
@@ -404,7 +406,7 @@ export class NativeCore {
     const regs = this.regs.get(pkg);
     if (regs?.[kind].get(id)?.token !== token) return;
     regs[kind].delete(id);
-    if (kind === "panels" || kind === "strips") for (const feed of [...this.feeds.values()]) if (feed.pkg === pkg && feed.id === id) feed.stop("not-found");
+    if (kind === "panels" || kind === "strips" || kind === "notes") for (const feed of [...this.feeds.values()]) if (feed.pkg === pkg && feed.id === id) feed.stop("not-found");
     this.regsVersion++;
     this.capabilityChanged?.();
     this.#scheduleChanged();
@@ -429,6 +431,7 @@ export class NativeCore {
       bridge: this.version,
       panel(id, def) { return core.#register(this?.ctx, "panels", id, def); },
       strip(id, def) { return core.#register(this?.ctx, "strips", id, def); },
+      turnNote(id, def) { return core.#register(this?.ctx, "notes", id, def); },
       media(id, handler) { return core.#register(this?.ctx, "media", id, handler); },
       micro(id, def) { return core.#register(this?.ctx, "micro", id, def); },
       onCapability(handler) { return core.#register(this?.ctx, "capability", "events", handler); },
@@ -457,7 +460,7 @@ export class NativeCore {
       if (idle.length === 0) return undefined;
       idle[0].stop();
     }
-    const reg = this.registration(pkg, kind === "strip" ? "strips" : "panels", id);
+    const reg = this.registration(pkg, kind === "strip" ? "strips" : kind === "note" ? "notes" : "panels", id);
     feed = new Feed(this, key, pkg, id, kind, scope.scope, reg?.def.data, typeof locale === "string" ? locale : "");
     this.feeds.set(key, feed);
     feed.start();
@@ -468,7 +471,7 @@ export class NativeCore {
   patchFeed(pkg, id, scope, data) {
     for (const feed of this.feeds.values()) {
       if (feed.pkg !== pkg || feed.id !== id || feed.dataFn === undefined || feed.data === undefined) continue;
-      if (JSON.stringify(feed.scope) !== scope.key) continue;
+      if (feed.scopeKey !== scope.key) continue;
       // Merge over the newest value, including an emit still waiting for its 4 Hz slot.
       const current = feed.pending !== undefined ? feed.pending.value : feed.data;
       feed.push(mergeApply(current ?? {}, data));
@@ -504,6 +507,8 @@ export class Feed {
     this.id = id;
     this.kind = kind;
     this.scope = scope;
+    // Canonical scope is private; plugin callbacks receive a copy.
+    this.scopeKey = JSON.stringify(scope);
     this.dataFn = dataFn;
     this.locale = locale;
     this.epoch = randomBytes(3).toString("hex");
@@ -516,7 +521,7 @@ export class Feed {
     this.cancel = undefined;
     this.waiters = [];
     this.pending = undefined;
-    this.lastFlush = 0;
+    this.lastFlush = undefined;
     this.timer = undefined;
     this.linger = undefined;
     this.lastUsed = Date.now();
@@ -538,7 +543,7 @@ export class Feed {
     result.then((cancel) => {
       if (typeof cancel !== "function") return;
       if (this.stopped) {
-        try { cancel(); } catch {}
+        try { Promise.resolve(cancel()).catch(() => {}); } catch {}
       } else this.cancel = cancel;
     }, (error) => {
       if (this.stopped) return;
@@ -553,6 +558,9 @@ export class Feed {
     if (this.kind === "strip") {
       value = sanitizeStrip(d);
       if (value === undefined) return this.core.violation(this.pkg, "bad-data", `strip(${this.id}) emitted a non-object`);
+    } else if (this.kind === "note") {
+      value = sanitizeNotes(d);
+      if (value === undefined) return this.core.violation(this.pkg, "bad-data", `turnNote(${this.id}) emitted a non-object`);
     } else {
       if (d !== null && !isPlainObject(d)) return this.core.violation(this.pkg, "bad-data", `data(${this.id}) emitted a non-object`);
       const json = toJson(d);
@@ -569,7 +577,8 @@ export class Feed {
     if (this.stopped) return;
     this.pending = { value };
     if (this.timer !== undefined) return;
-    const wait = Math.max(0, this.lastFlush + 1000 / LIMITS.dataHz - Date.now());
+    const wait = this.lastFlush === undefined ? 0
+      : Math.max(0, Math.ceil(this.lastFlush + 1000 / LIMITS.dataHz - performance.now()));
     this.timer = setTimeout(() => this.#flush(), wait);
     this.timer.unref?.();
   }
@@ -579,7 +588,7 @@ export class Feed {
     if (this.stopped || this.pending === undefined) return;
     const next = this.pending.value;
     this.pending = undefined;
-    this.lastFlush = Date.now();
+    this.lastFlush = performance.now();
     const prev = this.data;
     if (prev !== undefined && deepEqual(prev, next)) return;
     const base = this.rev;
@@ -587,6 +596,8 @@ export class Feed {
     this.rev = `${this.epoch}.${this.seq}`;
     this.data = next;
     for (const w of this.waiters.splice(0)) w();
+    // Later subscribers receive the current full data, not these unsent patches.
+    if (this.subs.size === 0) return;
     let msg;
     if (prev !== undefined && prev !== null && next !== null && base !== null) {
       const merge = mergeDiff(prev, next);
@@ -601,9 +612,15 @@ export class Feed {
   waitFirst(ms) {
     if (this.data !== undefined || this.stopped) return Promise.resolve();
     return new Promise((resolve) => {
-      const timer = setTimeout(resolve, ms);
+      const done = () => {
+        clearTimeout(timer);
+        const index = this.waiters.indexOf(done);
+        if (index !== -1) this.waiters.splice(index, 1);
+        resolve();
+      };
+      const timer = setTimeout(done, ms);
       timer.unref?.();
-      this.waiters.push(() => { clearTimeout(timer); resolve(); });
+      this.waiters.push(done);
     });
   }
 
@@ -655,7 +672,8 @@ export class Feed {
     if (this.core.feeds.get(this.key) === this) this.core.feeds.delete(this.key);
     if (this.cancel) {
       try {
-        this.cancel();
+        // Start cleanup now, but own its rejection without delaying retirement.
+        Promise.resolve(this.cancel()).catch((error) => this.core.ctx.logger?.warn?.(error));
       } catch (error) {
         this.core.ctx.logger?.warn?.(error);
       }

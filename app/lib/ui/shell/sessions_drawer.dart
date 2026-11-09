@@ -19,11 +19,13 @@ import '../../state/engine_control.dart';
 import '../../state/hosts_state.dart';
 import '../../state/drawer_view_state.dart';
 import '../../state/session_attention_state.dart';
+import '../../state/session_deletion_state.dart';
 import '../../state/sessions_state.dart';
 import '../../state/read_list_identity.dart';
 import '../../state/workspaces_state.dart';
 import '../bots/bots_page.dart' show BotsPage, UnreadBadge;
 import '../chat/media/media_format.dart' show chatTitleShown;
+import '../common/app_dialog.dart';
 import '../common/app_sheet.dart';
 import '../common/empty_view.dart';
 import '../common/pressable.dart';
@@ -33,6 +35,7 @@ import '../common/status_dot.dart';
 import '../onboarding/local_install.dart';
 import '../remote/host_status.dart';
 import '../remote/host_switcher.dart' show showHostSheet;
+import '../remote/network_details_sheet.dart' show showRemoteNetworkDetails;
 import '../safe_mode/engine_failure_card.dart';
 import '../safe_mode/safe_mode_banner.dart';
 import '../share/share_entry.dart';
@@ -44,18 +47,17 @@ import '../workspace/workspaces_page.dart';
 import 'adaptive/adaptive_layout.dart' show WindowClass;
 import 'brand_mark.dart';
 import 'drawer/drawer_actions.dart';
+import 'drawer/drawer_destination.dart';
 import 'drawer/archive_notice.dart';
 import 'drawer/drawer_filter_bar.dart';
 import 'drawer/drawer_list.dart';
 import 'drawer/selection_bars.dart';
+import 'drawer/session_deletion.dart';
 import 'session_search_page.dart';
 
 export '../../state/drawer_view_state.dart' show SessionDay, sessionDayOf;
+export 'drawer/drawer_destination.dart';
 export 'drawer/session_tile.dart' show SessionTile;
-
-/// Secondary destinations the drawer (or something inside it) can open.
-/// Pages the drawer opens; [settingsSearch] is ⚙ held down.
-enum DrawerDestination { web, remote, plugins, engine, settings, settingsSearch, features }
 
 /// Display title for a session: DSH's generated title (a generation
 /// request's header left out), else a neutral fallback.
@@ -76,7 +78,14 @@ Color sessionSelectionColor(BuildContext context) {
 /// bottom (the host, 网页版, 设置). In multi-select the brand row and the
 /// identity bar give way to the selection header and its action bar.
 class SessionsDrawer extends ConsumerWidget {
-  const SessionsDrawer({super.key, required this.onClose, required this.onOpen, this.now, this.identityBarHeight});
+  const SessionsDrawer({
+    super.key,
+    required this.onClose,
+    required this.onOpen,
+    this.now,
+    this.identityBarHeight,
+    this.drawerMotion,
+  });
 
   final VoidCallback onClose;
   final ValueChanged<DrawerDestination> onOpen;
@@ -88,6 +97,12 @@ class SessionsDrawer extends ConsumerWidget {
   /// multi-select) once it is laid out: the pulled-over drawer's notices
   /// stand above it.
   final ValueNotifier<double>? identityBarHeight;
+
+  /// The pulled-over drawer's 0 → 1 animation (null for the persistent
+  /// sidebar). While it moves, the panel drops its backdrop blur: a moving
+  /// glass surface re-samples the whole chat behind it every frame, which is
+  /// the expensive part on mid-range GPUs.
+  final Animation<double>? drawerMotion;
 
   /// Where the content sits in from either edge: the search bar, the rows'
   /// highlights and the identity bar's keys.
@@ -149,7 +164,7 @@ class SessionsDrawer extends ConsumerWidget {
                       ),
                     ),
                     // 网页模式, quietly: the one solid element stays 新对话.
-                    const WebModeKey(),
+                    const WebModeKey(tier: GlassTier.pill),
                     const SizedBox(width: 8),
                     NewChatButton(onTap: newChat),
                   ],
@@ -170,7 +185,7 @@ class SessionsDrawer extends ConsumerWidget {
         child: Row(
           children: [
             Expanded(child: WorkspaceSwitcher(onManage: manageWorkspaces)),
-            const _ViewOptionsKey(),
+            _ViewOptionsKey(onClose: onClose),
           ],
         ),
       ),
@@ -185,95 +200,97 @@ class SessionsDrawer extends ConsumerWidget {
       child: _SessionList(onClose: onClose, now: now),
     );
 
-    return GlassSurface(
-      tier: GlassTier.sheet,
-      borderRadius: const BorderRadius.only(
-        topRight: Radius.circular(AppShape.xl),
-        bottomRight: Radius.circular(AppShape.xl),
-      ),
-      child: Material(
-        type: MaterialType.transparency,
-        child: SafeArea(
-          right: false,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              if (short)
-                Expanded(
-                  child: NestedScrollView(
-                    headerSliverBuilder: (context, _) => [
-                      SliverToBoxAdapter(
-                        child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: top),
-                      ),
-                    ],
-                    body: list,
-                  ),
-                )
-              else ...[
-                ...top,
-                Expanded(child: list),
-              ],
-              // The action bar lies exactly over the identity bar, which
-              // keeps its size while hidden: same height at any text size.
-              _ReportHeight(
-                height: identityBarHeight,
-                child: Stack(
-                  children: [
-                    AnimatedOpacity(
-                      opacity: selecting ? 0 : 1,
-                      duration: quick,
-                      child: IgnorePointer(
-                        ignoring: selecting,
-                        child: ExcludeSemantics(
-                          excluding: selecting,
-                          child: IdentityBar(
-                            onHost: () => showHostSheet(context, onManage: () => onOpen(DrawerDestination.remote)),
-                            onFeatures: () => onOpen(DrawerDestination.features),
-                            onSettings: () => onOpen(DrawerDestination.settings),
-                            onSettingsHold: () => onOpen(
-                              ref.read(advancedBackendProvider)
-                                  ? DrawerDestination.settingsSearch
-                                  : DrawerDestination.settings,
-                            ),
-                          ),
+    const radius = BorderRadius.only(topRight: Radius.circular(AppShape.xl), bottomRight: Radius.circular(AppShape.xl));
+    final content = Material(
+      type: MaterialType.transparency,
+      child: SafeArea(
+        right: false,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            if (short)
+              Expanded(
+                child: NestedScrollView(
+                  headerSliverBuilder: (context, _) => [
+                    SliverToBoxAdapter(
+                      child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: top),
+                    ),
+                  ],
+                  body: list,
+                ),
+              )
+            else ...[
+              ...top,
+              Expanded(child: list),
+            ],
+            // The action bar lies exactly over the identity bar, which
+            // keeps its size while hidden: same height at any text size.
+            _ReportHeight(
+              height: identityBarHeight,
+              child: Stack(
+                children: [
+                  AnimatedOpacity(
+                    opacity: selecting ? 0 : 1,
+                    duration: quick,
+                    child: IgnorePointer(
+                      ignoring: selecting,
+                      child: ExcludeSemantics(
+                        excluding: selecting,
+                        child: IdentityBar(
+                          onHost: () => showHostSheet(context, onManage: () => onOpen(DrawerDestination.remote)),
+                          onLocalDetails: () => onOpen(DrawerDestination.engine),
+                          onFeatures: () => onOpen(DrawerDestination.features),
+                          onSettings: () => onOpen(DrawerDestination.settings),
+                          onSettingsHold: () => onOpen(ref.read(advancedBackendProvider) ? DrawerDestination.settingsSearch : DrawerDestination.settings),
                         ),
                       ),
                     ),
-                    Positioned.fill(
-                      child: AnimatedSwitcher(
-                        duration: quick,
-                        child: selecting
-                            ? SelectionActionBar(
-                                key: const ValueKey('selecting'),
-                                onMove: () {
-                                  if (ref.read(drawerScopeProvider)?.readOnly == false) {
-                                    moveToFolderFlow(
-                                      context,
-                                      ref,
-                                      ref.read(drawerSelectionProvider)?.toList() ?? const [],
-                                    );
-                                  }
-                                },
-                                onPin: () {
-                                  if (ref.read(drawerScopeProvider)?.readOnly == false) pinSelectionFlow(context, ref);
-                                },
-                                onArchive: () {
-                                  if (ref.read(drawerScopeProvider)?.readOnly == false) {
-                                    archiveSelectionFlow(context, ref);
-                                  }
-                                },
-                              )
-                            : const SizedBox.shrink(),
-                      ),
+                  ),
+                  Positioned.fill(
+                    child: AnimatedSwitcher(
+                      duration: quick,
+                      child: selecting
+                          ? SelectionActionBar(
+                              key: const ValueKey('selecting'),
+                              onMove: () {
+                                if (ref.read(drawerScopeProvider)?.readOnly == false) {
+                                  moveToFolderFlow(
+                                    context,
+                                    ref,
+                                    ref.read(drawerSelectionProvider)?.toList() ?? const [],
+                                  );
+                                }
+                              },
+                              onPin: () {
+                                if (ref.read(drawerScopeProvider)?.readOnly == false) pinSelectionFlow(context, ref);
+                              },
+                              onArchive: () {
+                                if (ref.read(drawerScopeProvider)?.readOnly == false) {
+                                  archiveSelectionFlow(context, ref);
+                                }
+                              },
+                              onDelete: () {
+                                if (ref.read(drawerScopeProvider)?.readOnly == false) {
+                                  unawaited(deleteSelectionFlow(context, ref));
+                                }
+                              },
+                            )
+                          : const SizedBox.shrink(),
                     ),
-                  ],
-                ),
+                  ),
+                ],
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );
+
+    final motion = drawerMotion;
+    if (motion == null) {
+      return GlassSurface(tier: GlassTier.sheet, borderRadius: radius, child: content);
+    }
+    return SlidingGlass(motion: motion, tier: GlassTier.sheet, borderRadius: radius, child: content);
   }
 }
 
@@ -357,16 +374,20 @@ class NewChatButton extends StatelessWidget {
 /// 「对话列表」 options at the end of the workspace row, its circle on the 10
 /// line; only while there are conversations to organise.
 class _ViewOptionsKey extends ConsumerWidget {
-  const _ViewOptionsKey();
+  const _ViewOptionsKey({required this.onClose});
+
+  final VoidCallback onClose;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final scope = ref.watch(drawerScopeProvider);
     final filtered = ref.watch(drawerFilterProvider) != DrawerFilter.all;
-    if (scope == null || (scope.sessions.isEmpty && !filtered)) return const SizedBox.shrink();
+    ref.watch(sessionsProvider);
+    final hasArchived = ref.read(sessionsProvider.notifier).archivedSessions.isNotEmpty;
+    if (scope == null || (scope.sessions.isEmpty && !filtered && !hasArchived)) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(right: 10),
-      child: DrawerViewButton(onTap: () => openDrawerViewOptions(context, ref)),
+      child: DrawerViewButton(onTap: () => openDrawerViewOptions(context, ref, onClose: onClose)),
     );
   }
 }
@@ -434,12 +455,13 @@ class _SessionList extends ConsumerWidget {
     // fold into one row that opens the Bot pages.
     final botReady = ref.watch(dsBotProvider.select((s) => s.ready));
     final showBots = scope.bots.isNotEmpty || (workspace == null && botReady);
-    if (scope.sessions.isEmpty && !showBots) {
+    if (scope.sessions.isEmpty && !showBots && ref.watch(drawerViewProvider).folders.isEmpty) {
       if (scope.readOnly) return _Centered(child: Text(readListStatusText(scope.status)));
       return workspace == null ? const _EmptyState() : const _WorkspaceEmptyState();
     }
     return DrawerConversationList(
       now: now,
+      onNewChat: onClose,
       readOnly: scope.readOnly,
       leading: showBots
           ? DsBotDrawerRow(
@@ -471,6 +493,21 @@ class _SessionList extends ConsumerWidget {
   }
 
   Future<void> _showActions(BuildContext context, WidgetRef ref, SessionSummary s) async {
+    // Consent belongs to the host/generation present before the action sheet.
+    final owner = captureSessionDeletionOwner(ref);
+    try {
+      await _showOwnedActions(context, ref, s, owner);
+    } finally {
+      owner?.close();
+    }
+  }
+
+  Future<void> _showOwnedActions(
+    BuildContext context,
+    WidgetRef ref,
+    SessionSummary s,
+    SessionDeletionOwner? deletionOwner,
+  ) async {
     final title = sessionTitle(s);
     final workspaces = ref.read(workspacesProvider);
     final pinned = workspaces.pinnedSessionIds.contains(s.sessionId);
@@ -522,6 +559,13 @@ class _SessionList extends ConsumerWidget {
                       subtitle: Text(context.l10n.shellArchiveStopsTurn),
                       onTap: () => Navigator.pop(sheet, 'archive'),
                     ),
+                    SessionDeleteTile(
+                      ids: [s.sessionId],
+                      owner: deletionOwner,
+                      onTap: () {
+                        if (deletionOwner?.isCurrent(ref) == true) Navigator.pop(sheet, 'delete');
+                      },
+                    ),
                   ],
                 ),
                 const SizedBox(height: 12),
@@ -557,6 +601,10 @@ class _SessionList extends ConsumerWidget {
         } catch (_) {
           messenger?.showSnackBar(SnackBar(content: Text(appL10n.shellRenameFailed)));
         }
+      case 'delete':
+        if (deletionOwner != null && deletionOwner.isCurrent(ref)) {
+          await deleteSessionsFlow(context, ref, [s.sessionId], owner: deletionOwner);
+        }
       case 'archive':
         unawaited(
           scheduleArchiveNotice(context, ref, [
@@ -568,7 +616,7 @@ class _SessionList extends ConsumerWidget {
 
   Future<String?> _askTitle(BuildContext context, String initial) {
     final controller = TextEditingController(text: initial);
-    return showDialog<String>(
+    return showAppDialog<String>(
       context: context,
       builder: (dialog) => AlertDialog(
         title: Text(context.l10n.shellRenameChat),
@@ -866,9 +914,8 @@ class _RemoteEmptyState extends ConsumerWidget {
   }
 }
 
-/// The drawer's footer: who this is talking to (the active host and its state;
-/// tap to switch, or to manage remote hosts), then 网页版 and 设置 as two equal
-/// round buttons.
+/// The drawer's footer: the host icon opens its details; the name and dropdown
+/// switch hosts. 全部功能 and 设置 follow as two equal round buttons.
 class IdentityBar extends ConsumerWidget {
   const IdentityBar({
     super.key,
@@ -876,9 +923,13 @@ class IdentityBar extends ConsumerWidget {
     required this.onFeatures,
     required this.onSettings,
     this.onSettingsHold,
+    this.onLocalDetails,
   });
 
   final VoidCallback onHost;
+
+  /// Local hosts have engine details, not a remote network path.
+  final VoidCallback? onLocalDetails;
 
   /// 全部功能: what there is to do now. (网页版 is in 全部功能, in 设置 ›
   /// 界面 and on the brand row's switch.)
@@ -899,6 +950,9 @@ class IdentityBar extends ConsumerWidget {
     final host = ref.watch(activeHostProvider);
     final name = ref.watch(hostNameProvider(host)) ?? (host.isLocal ? l10n.commonThisPhone : l10n.commonRemoteHost);
     final view = watchHostStatus(ref, host);
+    final link = host.kind == HostKind.relay ? ref.watch(hostLinkStatusProvider(host)).value : null;
+    final path = link?.isConnected == true ? link?.network?.path ?? link?.path : null;
+    final statusLabel = path == null ? view.label : path.label;
     final tint = hostKindTint(host.kind);
     return Padding(
       // Same 10 / 20 grid as the rows above: the highlight's edge at 10, the
@@ -909,72 +963,90 @@ class IdentityBar extends ConsumerWidget {
       child: Row(
         children: [
           Expanded(
-            child: Semantics(
-              button: true,
-              label: l10n.shellCurrentHostLabel(name, view.label),
-              onTap: onHost,
-              excludeSemantics: true,
-              child: InkWell(
-                onTap: onHost,
-                customBorder: Squircle.border(AppShape.md),
-                child: ConstrainedBox(
-                  constraints: const BoxConstraints(minHeight: IdentityBar.keySize),
-                  child: Padding(
-                    padding: const EdgeInsets.fromLTRB(10, 0, 8, 0),
-                    child: Row(
-                      children: [
-                        DecoratedBox(
-                          decoration: ShapeDecoration(color: colors.identity[tint], shape: const CircleBorder()),
-                          child: SizedBox.square(
-                            dimension: 36,
-                            child: Icon(hostKindIcon(host.kind), size: 19, color: colors.onIdentity[tint]),
-                          ),
-                        ),
-                        const SizedBox(width: 12),
-                        Flexible(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              Text(
-                                name,
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                                style: theme.textTheme.titleSmall,
-                              ),
-                              Row(
-                                mainAxisSize: MainAxisSize.min,
-                                children: [
-                                  StatusDot(tone: view.tone, size: 6),
-                                  const SizedBox(width: 6),
-                                  Flexible(
-                                    child: AnimatedSwitcher(
-                                      duration: AppMotion.of(context, AppMotion.quick),
-                                      layoutBuilder: (current, previous) =>
-                                          Stack(alignment: Alignment.centerLeft, children: [...previous, ?current]),
-                                      child: Text(
-                                        view.label,
-                                        key: ValueKey(view.label),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: AppType.tabular(
-                                          theme.textTheme.bodySmall!.copyWith(color: colors.textTertiary),
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 4),
-                        Icon(AppIcons.dropdown, size: 18, color: colors.textTertiary),
-                      ],
+            child: Row(
+              key: const ValueKey('identity-host-controls'),
+              children: [
+                const SizedBox(width: 6),
+                IconButton(
+                  key: const ValueKey('identity-host-details'),
+                  tooltip: host.isLocal ? l10n.phoneEngineTitle : l10n.remoteNetworkDetails,
+                  onPressed: host.isLocal ? onLocalDetails : () => showRemoteNetworkDetails(context, host),
+                  padding: const EdgeInsets.all(4),
+                  constraints: const BoxConstraints.tightFor(width: keySize, height: keySize),
+                  style: IconButton.styleFrom(tapTargetSize: MaterialTapTargetSize.shrinkWrap),
+                  icon: DecoratedBox(
+                    decoration: ShapeDecoration(color: colors.identity[tint], shape: const CircleBorder()),
+                    child: SizedBox.square(
+                      dimension: 36,
+                      child: Icon(hostKindIcon(host.kind), size: 19, color: colors.onIdentity[tint]),
                     ),
                   ),
                 ),
-              ),
+                Expanded(
+                  child: Semantics(
+                    button: true,
+                    label: l10n.shellCurrentHostLabel(name, statusLabel),
+                    onTap: onHost,
+                    excludeSemantics: true,
+                    child: InkWell(
+                      key: const ValueKey('identity-host-switcher'),
+                      onTap: onHost,
+                      customBorder: Squircle.border(AppShape.md),
+                      child: ConstrainedBox(
+                        constraints: const BoxConstraints(minHeight: IdentityBar.keySize),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 8),
+                          child: Row(
+                            children: [
+                              Flexible(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Text(
+                                      name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: theme.textTheme.titleSmall,
+                                    ),
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        StatusDot(tone: view.tone, size: 6),
+                                        const SizedBox(width: 6),
+                                        Flexible(
+                                          child: AnimatedSwitcher(
+                                            duration: AppMotion.of(context, AppMotion.quick),
+                                            layoutBuilder: (current, previous) => Stack(
+                                              alignment: Alignment.centerLeft,
+                                              children: [...previous, ?current],
+                                            ),
+                                            child: Text(
+                                              statusLabel,
+                                              key: ValueKey(statusLabel),
+                                              maxLines: 1,
+                                              overflow: TextOverflow.ellipsis,
+                                              style: AppType.tabular(
+                                                theme.textTheme.bodySmall!.copyWith(color: colors.textTertiary),
+                                              ),
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              const SizedBox(width: 4),
+                              Icon(AppIcons.dropdown, size: 18, color: colors.textTertiary),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           const SizedBox(width: 8),
@@ -1032,7 +1104,7 @@ class _RoundButton extends StatelessWidget {
         onTap: onTap,
         onLongPress: hold,
         excludeSemantics: true,
-        child: Pressable(child: button),
+        child: button,
       ),
     );
   }

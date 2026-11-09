@@ -148,13 +148,31 @@ export function selectedRequest(args, snapshot, readyServices, toolName = 'gener
     || typeof args.prompt !== 'string' || !args.prompt.trim()
     || Buffer.byteLength(args.prompt, 'utf8') > 4096) throw new MediaError('invalid_request');
   const candidates = readyServices.filter(service => service.modelIds.some(id => supports(catalogModel(id), toolName)));
-  const defaultService = readyServices.find(s => s.id === snapshot.defaults.serviceId);
-  if (args.serviceId === undefined && snapshot.defaults.serviceId && !defaultService) throw new MediaError('not_configured');
-  const serviceId = args.serviceId ?? (candidates.some(s => s.id === defaultService?.id) ? defaultService.id : candidates[0]?.id);
+  const video = toolName === 'generate_video';
+  const kindServiceId = (video ? snapshot.defaults.videoServiceId : snapshot.defaults.imageServiceId) ?? '';
+  const kindModelId = (video ? snapshot.defaults.videoModelId : snapshot.defaults.imageModelId) ?? '';
+  const legacyServiceId = snapshot.defaults.serviceId ?? '';
+  const legacyModelId = snapshot.defaults.modelId ?? '';
+  const legacyService = readyServices.find(s => s.id === legacyServiceId);
+  let serviceId = args.serviceId;
+  if (serviceId === undefined) {
+    // New per-kind defaults win only when they point at a service that can
+    // serve this tool; otherwise fall back to the legacy pair (whose missing
+    // target still fails closed) and finally to the first candidate.
+    if (kindServiceId && candidates.some(s => s.id === kindServiceId)) serviceId = kindServiceId;
+    else {
+      if (legacyServiceId && !legacyService) throw new MediaError('not_configured');
+      serviceId = candidates.some(s => s.id === legacyService?.id) ? legacyService.id : candidates[0]?.id;
+    }
+  }
   const service = candidates.find(item => item.id === serviceId);
   if (!service) throw new MediaError('not_configured');
   const allowedModels = service.modelIds.filter(id => supports(catalogModel(id), toolName));
-  const modelId = args.modelId ?? (allowedModels.includes(snapshot.defaults.modelId) ? snapshot.defaults.modelId : allowedModels[0]);
+  // Explicit argument, then the kind pair, then the legacy pair, then the
+  // service's first supported model. Empty new fields preserve old behavior.
+  const modelId = args.modelId
+    ?? (kindModelId && allowedModels.includes(kindModelId) ? kindModelId
+      : (legacyModelId && allowedModels.includes(legacyModelId) ? legacyModelId : allowedModels[0]));
   if (!allowedModels.includes(modelId)) throw new MediaError('invalid_request');
   const model = catalogModel(modelId);
   if (!model || model.profile !== service.profile) throw new MediaError('invalid_request');
@@ -192,6 +210,11 @@ export function installMedia(ctx, config, { generate, admit = admitGeneration, e
   const production = generate === undefined;
   generate ??= (request, context) => generateMedia(request, { ...context, ...engineOptions });
   const results = new Map();
+  // Jobs emits removed only after owner teardown has awaited producer settlement.
+  // Retain cards while their jobs are queryable, not the Session after removal.
+  const stopResults = ctx.jobs.events.subscribe({ owners: 'all' }, event => {
+    if (event.type === 'removed') results.delete(event.job.id);
+  });
   const hostStateDir = join(resolveDshHome(config.dshHome), 'media', 'dsh-media');
   const lifetime = new AbortController();
   const operations = new Set();
@@ -427,6 +450,8 @@ export function installMedia(ctx, config, { generate, admit = admitGeneration, e
     lifetime.abort(new MediaError('cancelled'));
     retire();
     await Promise.allSettled([...operations]);
+    results.clear();
+    await stopResults();
   }
 
   ctx.effect(() => dispose);

@@ -13,6 +13,8 @@ import 'package:dsh_app/runtime/runtime_state.dart';
 import 'package:dsh_app/state/connection_state.dart';
 import 'package:dsh_app/state/hosts_state.dart';
 import 'package:dsh_app/state/sessions_state.dart';
+import 'package:dsh_app/state/models_state.dart';
+import 'package:dsh_app/state/new_chat_modes.dart';
 import 'package:dsh_app/ui/chat/chat_screen.dart';
 import 'package:dsh_app/ui/chat/composer.dart';
 import 'package:dsh_app/ui/chat/widgets/attachments.dart';
@@ -161,6 +163,15 @@ void main() {
     await frames(tester);
     final container = ProviderScope.containerOf(tester.element(find.byType(ChatScreen)));
     expect(container.read(currentSessionProvider), isNull);
+    expect(find.byKey(const ValueKey('new-chat-preset')), findsNothing);
+    expect(find.byKey(const ValueKey('new-chat-permission')), findsNothing);
+    // Even a restored DSH-only choice must not block a Codex first message.
+    container.read(pendingNewChatModesProvider.notifier).selectPreset('minimal');
+    container.read(pendingNewChatModesProvider.notifier).selectPermission('danger-full-access');
+    container.read(pendingModelProvider.notifier).select(
+      const ModelSelection(provider: 'codex', model: 'm', reasoningEffort: 'low'),
+    );
+    await frames(tester);
     await tester.enterText(
       find.descendant(of: find.byType(Composer), matching: find.byType(EditableText)),
       'my first message',
@@ -175,6 +186,8 @@ void main() {
     expect(wire.calls.singleWhere((c) => c.method == 'thread/start').args['cwd'], '/work');
     final sent = wire.calls.singleWhere((c) => c.method == 'turn/start');
     expect((sent.args['input'] as List).single['text'], 'my first message');
+    expect(sent.args['model'], 'm');
+    expect(sent.args['effort'], 'low');
     expect(tester.widget<Composer>(find.byType(Composer)).busy, isFalse);
     expect(wire.calls.any((c) => c.method == 'thread/resume'), isFalse);
     await tester.pumpWidget(const SizedBox());

@@ -371,6 +371,19 @@ void main() {
     );
     expect(wire.calls.any((c) => c.method.startsWith('config/')), isFalse);
   });
+  test('new model-result API applies selection to the next Codex turn', () async {
+    final result = await client.setModelResult(
+      't', provider: 'codex', model: 'm', reasoningEffort: 'low',
+    );
+    expect(result.selected.model, 'm');
+    expect(result.selected.reasoningEffort, 'low');
+    expect(result.defaultSave, isNull);
+    await client.prompt('t', 'chosen model', requestId: 'model-result');
+    final turn = wire.calls.lastWhere((c) => c.method == 'turn/start');
+    expect(turn.args['model'], 'm');
+    expect(turn.args['effort'], 'low');
+    expect(wire.calls.any((c) => c.method.startsWith('config/')), isFalse);
+  });
   test('archive never implicitly stops a running thread', () async {
     wire.thread['status'] = {'type': 'active'};
     await expectLater(

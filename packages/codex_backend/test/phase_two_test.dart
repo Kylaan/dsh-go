@@ -20,6 +20,14 @@ void main() {
     await client.ready();
   });
   tearDown(() => client.close());
+  test('oversized files fail before any SFTP upload', () async {
+    expect(client.capabilities.fileUploadLimit, 30 * 1024 * 1024);
+    await expectLater(
+      client.uploadFile('t', Uint8List(30 * 1024 * 1024 + 1), name: 'large.bin'),
+      throwsA(isA<DshRemoteException>()),
+    );
+    expect(files.data, isEmpty);
+  });
   test(
     'mixed input uses uploaded image and scoped file, echoes survive history',
     () async {
@@ -67,7 +75,7 @@ void main() {
       expect(user.files.single.name, '资料.txt');
       expect(user.images, hasLength(1));
       expect(
-        (await client.attachment('t', user.images.single.attachmentId)).bytes,
+        (await client.attachment('t', user.images.single)).bytes,
         [137, 80, 78, 71],
       );
       await sub.cancel();
@@ -116,12 +124,12 @@ void main() {
       expect(tools.first.resultText, 'done');
       final image = tools.first.resultParts.whereType<ImagePart>().single;
       expect(
-        (await client.attachment('t', image.attachment.attachmentId)).bytes,
+        (await client.attachment('t', image.attachment)).bytes,
         [1, 2, 3],
       );
       final generated = tools.last.resultParts.whereType<ImagePart>().single;
       expect(
-        (await client.attachment('t', generated.attachment.attachmentId)).bytes,
+        (await client.attachment('t', generated.attachment)).bytes,
         [4, 5, 6],
       );
       await sub.cancel();

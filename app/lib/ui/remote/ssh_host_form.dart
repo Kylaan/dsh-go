@@ -13,6 +13,7 @@ import '../../state/attachments.dart';
 import '../../state/connection_state.dart';
 import '../../state/hosts_state.dart';
 import '../providers/provider_widgets.dart' show FormFieldBlock, FormFieldGroup;
+import '../common/app_dialog.dart';
 import '../settings/settings_widgets.dart';
 import '../shell/page_frame.dart';
 import '../theme/app_icons.dart';
@@ -320,8 +321,13 @@ class _SshHostFormPageState extends ConsumerState<SshHostFormPage> {
     if (config == null) return;
     setState(() => _saving = true);
     try {
-      await ref.read(hostsProvider.notifier).saveSsh(config, secrets: _secrets);
-      if (mounted) Navigator.of(context).pop(config);
+      final saved = await ref.read(hostsProvider.notifier).saveSsh(config, secrets: _secrets);
+      if (!mounted) return;
+      if (!saved) {
+        setState(() => _formError = context.l10n.commonSaveFailed);
+        return;
+      }
+      Navigator.of(context).pop(config);
     } catch (e) {
       if (mounted) setState(() => _formError = context.l10n.commonSaveFailed);
     } finally {
@@ -330,7 +336,7 @@ class _SshHostFormPageState extends ConsumerState<SshHostFormPage> {
   }
 
   Future<void> _resetKey() async {
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (dialog) => AlertDialog(
         title: Text(context.l10n.remoteHostKeyResetTitle),
@@ -361,7 +367,7 @@ class _SshHostFormPageState extends ConsumerState<SshHostFormPage> {
 
   Future<void> _delete() async {
     final name = widget.existing!.name;
-    final ok = await showDialog<bool>(
+    final ok = await showAppDialog<bool>(
       context: context,
       builder: (dialog) => AlertDialog(
         title: Text(context.l10n.remoteDeleteHostTitle(name)),

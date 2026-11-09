@@ -1,11 +1,10 @@
-// 设置 › 能力 › 图像与视频 (docs/design/media-generation.md §5.8, first
-// version): the media plugin's own settings, drawn from its schema by the
-// native form — services, write-only keys, defaults, limits. The namespace is
-// the one whose schema carries the catalogue (the host may rename the
-// instance), else the plugin's own name. Without the plugin on this host:
-// 「在此主机上安装」, which installs the official market's media plugin
-// (docs/design/plugin-market.md §6). The curated page of §5.8 (services,
-// usage, works) comes later (M6 proper).
+// 设置 › 能力 › 图像与视频 (docs/design/media-generation.md §5.8): the curated
+// page over the media plugin's settings (ui/settings/media/), found under the
+// namespace whose schema carries the catalogue (the host may rename the
+// instance), else the plugin's own name. The schema form is not drawn here
+// any more: services, keys, defaults and the cost guard are curated rows.
+// Without the plugin on this host: 「在此主机上安装」, which installs the
+// official market's media plugin (docs/design/plugin-market.md §6).
 
 import 'dart:async';
 
@@ -14,17 +13,19 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../l10n/l10n.dart';
 import '../../state/engine_settings_state.dart';
+import '../../state/connection_state.dart';
 import '../../state/media_generation.dart';
+import '../../state/hosts_state.dart';
 import '../../state/plugins_state.dart';
 import '../common/app_sheet.dart';
 import '../common/empty_view.dart';
-import '../engine_settings/engine_settings_page.dart' show EngineSettingsPage;
 import '../plugins/plugin_actions.dart' show installMarketEntry;
 import '../plugins/plugin_detail_sheet.dart' show showMarketPluginSheet;
 import '../plugins/plugin_widgets.dart' show PluginInstallProgress;
 import '../plugins/plugins_screen.dart';
 import '../shell/page_frame.dart';
 import '../theme/app_icons.dart';
+import 'media/media_settings_home.dart';
 
 class MediaSettingsPage extends ConsumerWidget {
   const MediaSettingsPage({super.key});
@@ -37,10 +38,10 @@ class MediaSettingsPage extends ConsumerWidget {
         (namespaces == null ? null : mediaNamespacesOf(namespaces).firstOrNull) ??
         mediaSettingsNamespaces.where((n) => namespaces?.containsKey(n) ?? false).firstOrNull;
     final plugin = ref.watch(mediaPluginProvider);
-    if (ns != null) return EngineSettingsPage(ns: ns, title: l10n.mediaSettingsTitle);
-    // Still reading what the host has: the form's own loading state.
+    if (ns != null) return MediaSettingsHomePage(ns: ns);
+    // Still reading what the host has: the scaffold's own loading state.
     if (namespaces == null && plugin == MediaPluginState.ready) {
-      return EngineSettingsPage(ns: mediaSettingsNamespaces.first, title: l10n.mediaSettingsTitle);
+      return MediaSettingsHomePage(ns: mediaSettingsNamespaces.first);
     }
     return AppPage.list(title: l10n.mediaSettingsTitle, children: const [SizedBox(height: 48), MediaInstallPrompt()]);
   }
@@ -75,8 +76,35 @@ class MediaInstallPrompt extends ConsumerWidget {
       await showMarketPluginSheet(context, entry);
       return;
     }
-    final job = await installMarketEntry(context, entry);
-    if (job?.phase == PluginInstallPhase.succeeded && context.mounted) onInstalled?.call();
+    // This consumer closes its sheet; the shared install result may still be
+    // returned after its Host or route has lost ownership.
+    final container = ProviderScope.containerOf(context, listen: false);
+    final originHost = container.read(activeHostProvider);
+    final route = ModalRoute.of(context);
+    var retired = false;
+    final hostChanges = container.listen(activeHostProvider, (_, next) {
+      if (next != originHost) retired = true;
+    });
+    // A display PluginHost can disappear/rebuild while this same client
+    // recovers a lost install response. Only a replacement client retires it.
+    final connectionChanges = container.listen(activeConnectionProvider, (_, next) {
+      final client = next.value?.client;
+      if (client != null && !identical(client, host.client)) retired = true;
+    });
+    try {
+      final job = await installMarketEntry(context, entry);
+      if (job?.phase == PluginInstallPhase.succeeded &&
+          context.mounted &&
+          !retired &&
+          container.read(activeHostProvider) == originHost &&
+          identical(container.read(activeConnectionProvider).value?.client, host.client) &&
+          route?.isCurrent == true) {
+        onInstalled?.call();
+      }
+    } finally {
+      hostChanges.close();
+      connectionChanges.close();
+    }
   }
 
   @override

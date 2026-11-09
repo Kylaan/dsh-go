@@ -1,5 +1,7 @@
 # 发包准备与执行说明
 
+> 0.3.0 待发布：npm 正式发布并核验 tarball 后，把 `market/plugins/@ccch1mneyyy__dsh-media.json` 的 `version` 改为 `0.3.0`，再按 `market/VERIFICATION.md` 重建索引；在 npm 发布前不要把 market 指向 0.3.0。
+
 当前版本 `@ccch1mneyyy/dsh-media@0.2.1` 已于 2026-10-31（Asia/Singapore）通过具备直发权限的 granular token 正式发布到 npm。HTTP 202 接受后，2026-10-30 19:55:51 UTC 匿名精确版本查询与公开 tarball 下载均为 200，registry SHA512 与本地 SHA256 双重核验通过。无需人工暂存审批。包名使用用户授权的备用组织；设置 namespace / bundle entry ID 保持 `dsh-media`，现有 App 支持 `/dsh-media` 包名，不需要发 App 新版。
 
 发布包为 48,019 bytes、19 个常规文件，SHA256 为 `9829f5106dec8cb354c203c74cc0510656f0f94538c36abf0fb80226388d13c9`。与 306/306 通过的版本逐文件对比，只有 package.json 的版本从 0.2.0 变为 0.2.1，运行时代码完全一致。显式 files 清单不含测试、凭据、私有日志或开发依赖。
@@ -52,7 +54,7 @@ npm stage approve 87e228cd-1e3b-4014-8410-f49ab24581af --auth-type=web
 
 本包尚未配置公开来源的 `repository.url` 或 provenance workflow，**不能直接宣称满足公开 provenance 要求**。启用前须明确公开插件源码位置，在 package.json 填入与该公开仓库大小写一致的 `repository.url`；保持完整验证输入，重新跑测试。npm 的 provenance 要求公开源码和受支持的托管 runner；OIDC trusted publishing 的绑定也必须在 npm 侧配置。见 [provenance](https://docs.npmjs.com/generating-provenance-statements/) 与 [trusted publishing](https://docs.npmjs.com/trusted-publishers/)。
 
-下面是保留本仓库路径的模板，只有 owner 决定发布方案后才复制进 `.github/workflows/`。使用受保护 environment、显式 dispatch，并将 action tag 换成经 owner 审核的精确 commit。若抽出独立插件仓库，先移入同一 rc.4 锁和 header golden，再调整路径。
+下面是保留本仓库路径的模板，只有 owner 决定发布方案后才复制进 `.github/workflows/`。使用受保护 environment、显式 dispatch，并将 action tag 换成经 owner 审核的精确 commit。若抽出独立插件仓库，先移入两版已有 runtime 锁和 header golden，再调整路径。下面默认验证 `0.2.2-rc.1`；兼容性发布前还须用 `--dsh-version 0.2.1-rc.4` 准备另一套依赖并运行同样检查。
 
 ```yaml
 name: Publish media with provenance

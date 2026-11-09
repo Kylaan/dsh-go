@@ -15,29 +15,39 @@ import '../common/sheet_title_bar.dart';
 import '../theme/theme.dart';
 import 'balance_widgets.dart';
 
-/// `8,421` / `1.2 万` / `100 万` / `1.5 亿`。
+/// `999` / `1K` / `43K` / `500K` / `1.05M` / `100M`: K is a thousand and M a
+/// million in every UI language (no 万/亿), the same units model context
+/// windows are quoted in.
 String formatTokens(int n) {
-  String trim(double v) {
-    final text = v >= 100 ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
-    return text.endsWith('.0') ? text.substring(0, text.length - 2) : text;
+  String trimZeros(String text) {
+    if (!text.contains('.')) return text;
+    var end = text.length;
+    while (text[end - 1] == '0') {
+      end--;
+    }
+    if (text[end - 1] == '.') end--;
+    return text.substring(0, end);
   }
 
-  if (n < 10000) {
-    final digits = n.abs().toString();
-    final buf = StringBuffer(n < 0 ? '-' : '');
+  final sign = n < 0 ? '-' : '';
+  final value = n.abs();
+  if (value < 1000) {
+    final digits = value.toString();
+    final buf = StringBuffer(sign);
     for (var i = 0; i < digits.length; i++) {
       if (i > 0 && (digits.length - i) % 3 == 0) buf.write(',');
       buf.write(digits[i]);
     }
     return buf.toString();
   }
-  if (AppLocale.isEnglish) {
-    return n < 1000000
-        ? appL10n.activityTokensTenThousands(trim(n / 1000))
-        : appL10n.activityTokensHundredMillions(trim(n / 1000000));
+  if (value < 1000000) {
+    final k = value / 1000;
+    // 43K and 500K stay whole; below 100 one decimal reads better (8.4K).
+    final text = trimZeros(k >= 100 ? k.toStringAsFixed(0) : k.toStringAsFixed(1));
+    // 999,900…999,999 would round up to 1000K: show the carry as M instead.
+    if (text != '1000') return '$sign${text}K';
   }
-  if (n < 100000000) return appL10n.activityTokensTenThousands(trim(n / 10000));
-  return appL10n.activityTokensHundredMillions(trim(n / 100000000));
+  return '$sign${trimZeros((value / 1000000).toStringAsFixed(2))}M';
 }
 
 /// `12%`;大于 0 但不到 1% 时写 `<1%`。
@@ -76,7 +86,7 @@ class ContextRing extends StatelessWidget {
         onTap: onTap,
         radius: 26,
         child: SizedBox(
-          height: 40,
+          height: 36,
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 6),
             child: Row(
@@ -146,9 +156,9 @@ Future<void> showUsageSheet(BuildContext context, {required String sessionId, Mo
 ///   用量                                   (×)
 ///     上下文
 ///   ╭──────────────────────────────────────╮
-///   │ 6%                    6.2 万 / 100 万 │
+///   │ 6%                      61.8K / 1M │
 ///   │ ▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱ │
-///   │ 系统 1,467 · 工具 5,157 · 消息 5.5 万   │
+///   │ 系统 1.5K · 工具 5.2K · 消息 54.9K    │
 ///   ╰──────────────────────────────────────╯
 ///     本对话 …          DeepSeek 余额 …
 /// ```
@@ -229,8 +239,8 @@ class SessionUsageSections extends StatelessWidget {
   }
 }
 
-/// 一个数:数字是等宽数字,后面的单位(`万`、`%`)小一号、次要色。
-/// `7.1 万` → **7.1** 万;`¥110.00` → ¥ **110.00**。纯文本仍是原字符串。
+/// 一个数:数字是等宽数字,后面的单位(`K`、`M`、`%`)小一号、次要色。
+/// `71K` → **71** K;`¥110.00` → ¥ **110.00**。纯文本仍是原字符串。
 class UsageFigure extends StatelessWidget {
   const UsageFigure(this.text, {super.key, required this.style, this.color});
 
@@ -277,8 +287,9 @@ class _ContextSection extends StatelessWidget {
     final theme = Theme.of(context);
     final colors = theme.colorScheme;
     final dsh = DshColors.of(context);
-    final fraction = usage.contextFraction;
     final window = usage.contextWindow;
+    final tokens = usage.contextTokens;
+    final fraction = usage.contextFraction;
 
     final breakdown = [
       if (usage.systemTokens case final n? when n > 0) l10n.activityUsageSystemTokens(formatTokens(n)),
@@ -290,10 +301,18 @@ class _ContextSection extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.fromLTRB(16, 14, 16, 14),
       child: fraction == null || window == null
-          ? Text(l10n.activityUsageAfterMessage, style: theme.textTheme.bodyMedium?.copyWith(color: dsh.textTertiary))
+          ? Text(
+              l10n.activityUsageWaiting,
+              style: theme.textTheme.bodyMedium?.copyWith(color: dsh.textTertiary),
+            )
           : Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
+                Text(
+                  usage.projectedTokens != null ? l10n.activityUsageProjected : l10n.activityUsageLastRequest,
+                  style: theme.textTheme.bodySmall?.copyWith(color: dsh.textTertiary),
+                ),
+                const SizedBox(height: 4),
                 Row(
                   crossAxisAlignment: CrossAxisAlignment.baseline,
                   textBaseline: TextBaseline.alphabetic,
@@ -305,7 +324,7 @@ class _ContextSection extends StatelessWidget {
                     ),
                     const Spacer(),
                     Text(
-                      '${formatTokens(usage.pressureTokens ?? 0)} / '
+                      '${formatTokens(tokens ?? 0)} / '
                       '${formatTokens(window)}',
                       style: AppType.tabular(theme.textTheme.bodySmall!.copyWith(color: colors.onSurfaceVariant)),
                     ),
@@ -318,6 +337,11 @@ class _ContextSection extends StatelessWidget {
                   Text(
                     breakdown.join(' · '),
                     style: AppType.tabular(theme.textTheme.bodySmall!.copyWith(color: dsh.textTertiary)),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    l10n.activityUsageBreakdownEstimate,
+                    style: theme.textTheme.bodySmall?.copyWith(color: dsh.textTertiary),
                   ),
                 ],
                 if (fraction > 0.85) ...[
@@ -392,7 +416,10 @@ class _TokenSection extends StatelessWidget {
           Row(
             children: [
               Expanded(
-                child: _Stat(label: l10n.activityInput, value: formatTokens(usage.input)),
+                child: _Stat(
+                  label: l10n.activityUsageCumulativeInput,
+                  value: formatTokens(usage.input),
+                ),
               ),
               Expanded(
                 child: _Stat(label: l10n.activityOutput, value: formatTokens(usage.output)),

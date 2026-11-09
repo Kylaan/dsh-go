@@ -12,6 +12,13 @@ val keyProps = Properties().apply {
     rootProject.file("key.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
 
+// Debug builds use the release key only when it is all there; they are never the build
+// that should stop over a half-filled key.properties.
+// A password may be nothing but spaces; a path or an alias may not.
+val hasWholeReleaseKey = listOf("storeFile", "keyAlias").all { !keyProps.getProperty(it).isNullOrBlank() } &&
+    listOf("storePassword", "keyPassword").all { !keyProps.getProperty(it).isNullOrEmpty() } &&
+    file(keyProps.getProperty("storeFile")).exists()
+
 // Per-ABI runtime bundles produced by runtime/build-runtime.sh.
 val codexPreview = providers.gradleProperty("codexPreview").orNull == "true"
 
@@ -114,6 +121,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // tooling/dev-run.sh installs debug over the release build on a phone, data
+            // kept: Android only allows that with the same key.
+            if (hasWholeReleaseKey) signingConfig = signingConfigs.getByName("release")
+        }
         release {
             // Use the release key when configured; local builds without key.properties fall back to debug.
             signingConfig = signingConfigs.getByName(if (keyProps.isEmpty) "debug" else "release")
@@ -135,6 +147,8 @@ flutter {
 }
 
 dependencies {
+    // Bundled Chinese OCR. SDK statistics disclosed separately; initialization is opt-in per use.
+    implementation("com.google.mlkit:text-recognition-chinese:16.0.1")
     testImplementation("junit:junit:4.13.2")
 
     // .tar.xz support for the rootfs bundle.
@@ -144,7 +158,7 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")       // MIT
     implementation("dev.rikka.shizuku:provider:13.1.5")  // MIT
     implementation("com.github.MuntashirAkon:libadb-android:3.1.1") // used under its Apache-2.0 option; pulls in spake2-android (LGPL-3.0)
-    implementation("org.conscrypt:conscrypt-android:2.5.3")         // Apache-2.0: libadb TLS/pairing
+    implementation("org.conscrypt:conscrypt-android:2.8.0")         // Apache-2.0: libadb TLS/pairing
     // MIT: self-signed adb client cert. The same jdk15to18 family libadb-android
     // pulls in (bcprov-jdk15to18:1.81); adding jdk18on next to it duplicates every class.
     implementation("org.bouncycastle:bcpkix-jdk15to18:1.81")

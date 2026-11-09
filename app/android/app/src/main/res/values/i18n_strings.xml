@@ -3,18 +3,29 @@
      i18n/AppStrings.kt so it follows the app language. English here, Chinese in values-zh/. -->
 <resources>
     <!-- background -->
-    <string name="background_shizuku_missing">Shizuku isn’t installed</string>
+    <string name="background_shizuku_missing">No available Shizuku / Sui interface detected</string>
+    <string name="background_sui_stopped">The Sui interface is currently unavailable</string>
+    <string name="background_sui_permission">Sui permission not granted</string>
     <string name="background_shizuku_stopped">Shizuku isn’t running</string>
     <string name="background_shizuku_permission">Shizuku permission not granted</string>
     <string name="background_adb_not_paired">Wireless debugging isn’t paired</string>
     <string name="background_adb_disconnected">Not connected to local adbd. Turn on wireless debugging and reconnect</string>
+    <string name="background_adb_invalid_port">Enter a port from 1 to 65535</string>
     <string name="background_unsupported">This system doesn’t support the required trusted virtual display (possibly Android 15 QPR2)</string>
     <string name="background_off">Background mode is off</string>
     <string name="background_requires_android">Background mode needs Android 14 or later</string>
     <string name="background_unknown_mode">Unknown mode</string>
     <string name="background_not_ready">Privileged connection isn’t ready</string>
+    <string name="background_provider_mismatch">The selected %1$s channel does not match the current interface, which is provided by %2$s. Select %2$s and enable it again, or restore the %1$s service first.</string>
     <string name="background_no_response">Privileged connection isn’t responding</string>
-    <string name="background_injection_denied">Input was blocked. Turn on “USB debugging (Security settings)” and try again</string>
+    <string name="background_injection_denied">Could not confirm background input. Check channel permission and device support.</string>
+    <string name="background_input_window_not_ready">The input test window was not ready. No test tap was sent.</string>
+    <string name="background_input_unconfirmed">The input test did not receive both touch events in time.</string>
+    <string name="background_input_cancelled">The input test was cancelled.</string>
+    <string name="background_input_probe_busy">The background screen is in use. Retry the input test after the task ends.</string>
+    <string name="background_input_cleanup_failed">Input test cleanup was not confirmed. Reconnect the privileged channel before retrying.</string>
+    <string name="background_input_api_unavailable">This system has no background input API the App can use. Update the App, or report your device and system version.</string>
+    <string name="background_input_permission_denied">The system refused background input. Check the channel’s permission; on Xiaomi/Redmi, turn on “USB debugging (Security settings)”.</string>
     <!-- notify -->
     <string name="notify_decline">Decline</string>
     <string name="notify_allow_once">Allow once</string>
@@ -37,6 +48,10 @@
         <item quantity="other">%1$d reminders</item>
     </plurals>
     <string name="notify_new_reminder">New reminder</string>
+    <string name="live_channel">Live activity</string>
+    <string name="live_channel_description">What DSH is doing, waiting on, or doing on the phone, in the status bar and on the lock screen</string>
+    <string name="live_chip_phone">Acting</string>
+    <string name="live_chip_paused">Paused</string>
     <!-- overlay -->
     <string name="overlay_allow_task_no_ask">Allow for task</string>
     <string name="overlay_allow_task">Allow for task</string>
@@ -99,6 +114,8 @@
     <string name="pairing_port_missing">Pairing port not found. Open “Pair device with pairing code”</string>
     <string name="pairing_failed">Couldn’t pair. Get a new pairing code</string>
     <string name="pairing_error">Couldn’t pair: %1$s</string>
+    <string name="pairing_complete">Paired. Go back to the App and tap “Connect”.</string>
+    <string name="pairing_result_failure">%1$s\nGo back to the App and tap “Start pairing” to try again, or use “Enter manually”.</string>
     <!-- pet -->
     <string name="pet_open_chat">Open chat</string>
     <string name="pet_more">More</string>
@@ -115,6 +132,19 @@
     <string name="pet_probe_public">A turn finished</string>
     <string name="pet_ask">Ask</string>
     <string name="pet_new_chat">New chat</string>
+    <string name="pet_screenshot">Screenshot &amp; ask DSH-Go</string>
+    <string name="pet_wheel_screenshot">Screenshot</string>
+    <string name="pet_wheel_hint">Drag to choose\nRelease to act</string>
+    <string name="pet_wheel_stop">Stop</string>
+    <string name="pet_wheel_hosts">Hosts</string>
+    <string name="pet_wheel_snooze">Hide today</string>
+    <string name="pet_wheel_settings">Settings</string>
+    <string name="pet_screenshot_unsupported">Screenshots need Android 11 or later.</string>
+    <string name="pet_screenshot_accessibility">Enable DSH-Go accessibility in the App’s phone control settings first.</string>
+    <string name="pet_screenshot_secure">This screen blocks screenshots. DSH-Go won’t bypass its protection.</string>
+    <string name="pet_screenshot_busy">Another screenshot is in progress. Try again shortly.</string>
+    <string name="pet_screenshot_timeout">The screenshot timed out. Try again.</string>
+    <string name="pet_screenshot_failed">Couldn’t capture this screen. Try again.</string>
     <string name="pet_stop">Stop current task</string>
     <string name="pet_switch_host">Switch host</string>
     <string name="pet_ask_hint">Ask something</string>
@@ -188,13 +218,15 @@
     <string name="phone_share_chooser">Share to</string>
     <string name="phone_open_channel">Open from DSH</string>
     <string name="phone_open_notice">DSH · %1$s</string>
-    <string name="phone_tap_open">Tap to open</string>
+    <string name="phone_tap_open">Return to DSH to check the task. The action will not be repeated.</string>
     <string name="phone_reminder_channel">DSH reminders</string>
     <string name="phone_log_apps">List apps</string>
     <string name="phone_log_apps_filtered">List apps (filtered)</string>
     <string name="phone_log_open_url">Open link</string>
     <string name="phone_log_open_url_scheme">Open link %1$s:</string>
     <string name="phone_log_open_app">Open %1$s</string>
+    <string name="phone_log_system_returned_success">%1$s (system returned success; follow-up stopped)</string>
+    <string name="phone_log_system_returned_failure">%1$s (system returned failure; follow-up stopped)</string>
     <string name="phone_log_open_background">Open %1$s in background</string>
     <string name="phone_log_notify">Notification</string>
     <string name="phone_log_clipboard_read">Read clipboard</string>
@@ -260,8 +292,8 @@
     <string name="service_running">Local DSH is running</string>
     <string name="service_stopping">Stopping…</string>
     <string name="service_title">Local DSH</string>
-    <string name="service_stop_phone">Stop actions</string>
-    <string name="service_stop">Stop</string>
+    <string name="service_stop_phone">Stop phone control</string>
+    <string name="service_stop">Stop engine</string>
     <string name="service_package_checksum_failed">Runtime verification failed (SHA-256 mismatch). Reinstall the app</string>
     <string name="service_storage_insufficient">Not enough storage: about %1$s MB needed, %2$s MB available</string>
     <!-- share -->
@@ -273,5 +305,23 @@
     <!-- tile -->
     <string name="tile_new_chat_label">New chat</string>
     <string name="a11y_keeper_grant_failed">Authorization failed. You can use the computer command instead.</string>
+    <string name="a11y_keeper_grant_unavailable">The authorization request could not be completed. Check the authorization channel status.</string>
+    <string name="a11y_keeper_grant_denied">The system denied this request to grant the permission needed to restore accessibility automatically.</string>
+    <string name="a11y_keeper_grant_not_acquired">The authorization request was acknowledged, but the permission needed to restore accessibility automatically is still not granted.</string>
     <string name="a11y_keeper_needs_setup">Set up Shizuku or wireless debugging first.</string>
+    <string name="background_root_legacy_client">Root was selected. Use an updated interface to manage it, or turn phone control off.</string>
+    <string name="background_root_starting">Waiting for root authorization</string>
+    <string name="background_root_not_selected">Choose root to request authorization</string>
+    <string name="background_root_timeout">Root authorization or communication timed out. Select root again to retry.</string>
+    <string name="background_root_cancelled">Root startup was cancelled</string>
+    <string name="background_root_identity">The root process identity or protocol did not match</string>
+    <string name="background_root_disconnected">Root disconnected. Select root again to reconnect.</string>
+    <string name="background_root_grant_failed">WRITE_SECURE_SETTINGS was not granted. Check root access and try again.</string>
+    <string name="background_root_failed">Could not start root. Check the root manager and authorization.</string>
+    <string name="background_sui_not_provider">The current interface is not provided by Sui. Check Sui and restart the app.</string>
+    <string name="background_selection_cancelled">The channel selection was cancelled</string>
+    <string name="background_keep_phone_disabled">Turn on phone control before keeping this connection.</string>
+    <string name="background_keep_save_failed">Could not save the connection preference. Check it before restarting the app.</string>
+    <string name="background_viewport_invalid">Unknown background viewport preset</string>
+    <string name="background_viewport_save_failed">Could not save the background viewport preference.</string>
 </resources>

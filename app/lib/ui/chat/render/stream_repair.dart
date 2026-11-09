@@ -21,7 +21,40 @@
 /// Only the last block is looked at; everything before it is final.
 String repairStreamingMarkdown(String text) {
   if (text.isEmpty) return text;
-  final scan = _BlockScan(text);
+  return _repairWithScan(text, _BlockScan(text));
+}
+
+/// The same repair as [repairStreamingMarkdown], retaining the scan of complete
+/// lines while text is appended. The unfinished last line is always rescanned:
+/// appending to a fence closer can turn it back into ordinary code.
+///
+/// Input is the prepared Markdown, not the raw reply. If maths or table
+/// preparation rewrites an earlier line (or the reply is replaced/truncated),
+/// the prefix no longer matches and the whole scan starts again.
+class StreamingMarkdownRepair {
+  String _previous = '';
+  var _offset = 0;
+  var _prefix = _BlockScan.empty();
+
+  String repair(String text) {
+    if (!text.startsWith(_previous)) {
+      _offset = 0;
+      _prefix = _BlockScan.empty();
+    }
+    _previous = text;
+    if (text.isEmpty) return text;
+    for (var end = text.indexOf('\n', _offset); end != -1; end = text.indexOf('\n', _offset)) {
+      _prefix.addLine(text.substring(_offset, end), _offset);
+      _offset = end + 1;
+    }
+    final scan = _BlockScan.copy(_prefix);
+    if (_offset < text.length) scan.addLine(text.substring(_offset), _offset);
+    if (scan.lastBlockStart > text.length) scan.lastBlockStart = text.length;
+    return _repairWithScan(text, scan);
+  }
+}
+
+String _repairWithScan(String text, _BlockScan scan) {
   if (scan.openFenceLine != null) {
     // Inside an open fence the code streams as itself, except the opening
     // line while its info string is still being typed.
@@ -29,47 +62,62 @@ String repairStreamingMarkdown(String text) {
     return text.indexOf('\n', opener) == -1 ? text.substring(0, opener).trimRight() : text;
   }
   final start = scan.lastBlockStart;
-  final head = text.substring(0, start);
-  var tail = text.substring(start);
+  final originalTail = text.substring(start);
+  var tail = originalTail;
   final table = _unfinishedTableAt(tail);
   if (table != -1) tail = tail.substring(0, table).trimRight();
   tail = _dropPartialLastLine(tail);
   tail = _repairInline(tail);
-  return tail.trim().isEmpty ? head.trimRight() : head + tail;
+  if (tail.trim().isEmpty) return text.substring(0, start).trimRight();
+  if (identical(tail, originalTail)) return text;
+  return text.substring(0, start) + tail;
 }
 
 /// Where the last block starts and whether the text ends inside a fence.
 class _BlockScan {
+  _BlockScan.empty();
+
+  _BlockScan.copy(_BlockScan other)
+    : lastBlockStart = other.lastBlockStart,
+      _openFenceLine = other._openFenceLine,
+      _fenceChar = other._fenceChar,
+      _fenceLength = other._fenceLength;
+
   _BlockScan(String text) {
     var offset = 0;
-    String? fenceChar;
-    var fenceLength = 0;
     final lines = text.split('\n');
     // `abc\n` is one line, not a line and a blank one.
     if (lines.length > 1 && lines.last.isEmpty) lines.removeLast();
     for (final line in lines) {
-      final fence = _fence.firstMatch(line);
-      if (fenceChar != null) {
-        final close = _fenceClose.firstMatch(line);
-        if (close != null && close.group(1)![0] == fenceChar && close.group(1)!.length >= fenceLength) {
-          fenceChar = null;
-          lastBlockStart = offset + line.length + 1;
-        }
-      } else if (fence != null) {
-        fenceChar = fence.group(1)![0];
-        fenceLength = fence.group(1)!.length;
-        openFenceLine = offset;
-      } else if (line.trim().isEmpty || line.replaceAll(RegExp(r'[\s>]'), '').isEmpty) {
-        lastBlockStart = offset + line.length + 1;
-      }
+      addLine(line, offset);
       offset += line.length + 1;
     }
-    if (fenceChar == null) openFenceLine = null;
     if (lastBlockStart > text.length) lastBlockStart = text.length;
   }
 
   int lastBlockStart = 0;
-  int? openFenceLine;
+  int? _openFenceLine;
+  String? _fenceChar;
+  int _fenceLength = 0;
+
+  int? get openFenceLine => _fenceChar == null ? null : _openFenceLine;
+
+  void addLine(String line, int offset) {
+    final fence = _fence.firstMatch(line);
+    if (_fenceChar != null) {
+      final close = _fenceClose.firstMatch(line);
+      if (close != null && close.group(1)![0] == _fenceChar && close.group(1)!.length >= _fenceLength) {
+        _fenceChar = null;
+        lastBlockStart = offset + line.length + 1;
+      }
+    } else if (fence != null) {
+      _fenceChar = fence.group(1)![0];
+      _fenceLength = fence.group(1)!.length;
+      _openFenceLine = offset;
+    } else if (line.trim().isEmpty || line.replaceAll(RegExp(r'[\s>]'), '').isEmpty) {
+      lastBlockStart = offset + line.length + 1;
+    }
+  }
 
   static final _fence = RegExp(r'^[ \t]*(?:>[ \t]?)*[ \t]*(`{3,}|~{3,})(?!.*`)');
   static final _fenceClose = RegExp(r'^[ \t]*(?:>[ \t]?)*[ \t]*(`{3,}|~{3,})[ \t]*$');
@@ -140,12 +188,13 @@ class _InlineScan {
     final brackets = <int>[];
     var i = 0;
     while (i < n) {
-      final c = text[i];
-      if (c == r'\' && i + 1 < n) {
-        final next = text[i + 1];
+      // ASCII markers need no one-character String; indices stay UTF-16.
+      final c = text.codeUnitAt(i);
+      if (c == _backslash && i + 1 < n) {
+        final next = text.codeUnitAt(i + 1);
         // Maths is opaque: its `_` and `*` are not emphasis.
-        if (next == '(' || next == '[') {
-          final close = text.indexOf(next == '(' ? r'\)' : r'\]', i + 2);
+        if (next == _openParen || next == _openBracket) {
+          final close = text.indexOf(next == _openParen ? r'\)' : r'\]', i + 2);
           if (close == -1) break;
           i = close + 2;
           continue;
@@ -153,9 +202,9 @@ class _InlineScan {
         i += 2;
         continue;
       }
-      if (c == '`') {
+      if (c == _backtick) {
         var run = 0;
-        while (i + run < n && text[i + run] == '`') {
+        while (i + run < n && text.codeUnitAt(i + run) == _backtick) {
           run += 1;
         }
         final close = _closingRun(text, i + run, run);
@@ -167,18 +216,17 @@ class _InlineScan {
         i = close + run;
         continue;
       }
-      if (c == '*' || c == '_' || c == '~') {
-        i = _delimiterRun(i, c);
+      if (c == _asterisk || c == _underscore || c == _tilde) {
+        i = _delimiterRun(i, String.fromCharCode(c));
         continue;
       }
-      if (c == '[') {
+      if (c == _openBracket) {
         brackets.add(i);
-      } else if (c == ']' && brackets.isNotEmpty) {
+      } else if (c == _closeBracket && brackets.isNotEmpty) {
         final label = brackets.removeLast();
-        if (i + 1 < n && text[i + 1] == '(') {
-          final close = text.indexOf(')', i + 2);
-          final newline = text.indexOf('\n', i + 2);
-          if (close == -1 || (newline != -1 && newline < close)) {
+        if (i + 1 < n && text.codeUnitAt(i + 1) == _openParen) {
+          final close = text.indexOf(_linkTargetEnd, i + 2);
+          if (close == -1 || text[close] == '\n') {
             if (label > 0 && text[label - 1] == '!') {
               openImage = label - 1;
             } else {
@@ -200,12 +248,25 @@ class _InlineScan {
     }
   }
 
+  static const _backslash = 0x5c;
+  static const _backtick = 0x60;
+  static const _asterisk = 0x2a;
+  static const _underscore = 0x5f;
+  static const _tilde = 0x7e;
+  static const _openParen = 0x28;
+  static const _openBracket = 0x5b;
+  static const _closeBracket = 0x5d;
+
   final String text;
   final openers = <_Opener>[];
   int? openCode;
   int codeRun = 0;
   int? openLinkTarget;
   int? openImage;
+
+  // Stop at the first terminator instead of searching every link's entire
+  // remaining suffix for a newline after its closing parenthesis was found.
+  static final _linkTargetEnd = RegExp(r'[)\n]');
 
   /// A marker run at the very end that neither opened nor closed anything
   /// (`这是 **`, `然后 *`): it waits for the next character.

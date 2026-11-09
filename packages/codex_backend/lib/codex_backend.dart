@@ -81,6 +81,7 @@ class CodexChatClient extends DshClient {
     advanced: false,
     supportsQuietWatch: false,
     attachments: true,
+    fileUploadLimit: 30 * 1024 * 1024,
   );
   @override
   Stream<HostEvent> get hostEvents => _hostEvents.stream;
@@ -557,7 +558,10 @@ class CodexChatClient extends DshClient {
     String? name,
   }) async {
     if (files == null) throw unsupported;
-    final path = await files!.upload(name ?? 'file', Uint8List.fromList(bytes));
+    if (bytes.isEmpty || bytes.length > capabilities.fileUploadLimit!) {
+      throw const DshRemoteException('attachment/too-large', 'Codex file limit is 30 MiB');
+    }
+    final path = await files!.upload(name ?? 'file', bytes is Uint8List ? bytes : Uint8List.fromList(bytes));
     _receipts[path] = (sessionId: sessionId, path: path);
     return FileReceipt(
       path,
@@ -572,8 +576,9 @@ class CodexChatClient extends DshClient {
   @override
   Future<({ImageAttachment attachment, Uint8List bytes})> attachment(
     String sessionId,
-    String attachmentId,
+    ImageAttachment reference,
   ) async {
+    final attachmentId = reference.attachmentId;
     final v = _views[sessionId] ?? await _load(sessionId);
     for (final turn in v.turns.values) {
       for (final item in rows(turn['items'])) {
@@ -770,6 +775,21 @@ class CodexChatClient extends DshClient {
     _views[sessionId]?.changed();
     return selected;
   }
+
+  @override
+  Future<ModelSelectionResult> setModelResult(
+    String sessionId, {
+    required String provider,
+    required String model,
+    String? reasoningEffort,
+  }) async => ModelSelectionResult(
+    selected: await setModel(
+      sessionId,
+      provider: provider,
+      model: model,
+      reasoningEffort: reasoningEffort,
+    ),
+  );
 
   @override
   Future<List<({String id, String name})>> listProviders() async => [

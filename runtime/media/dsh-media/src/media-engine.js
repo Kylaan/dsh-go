@@ -3,7 +3,7 @@ import { open, realpath, lstat } from 'node:fs/promises';
 import { isAbsolute, relative, sep, join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
-import { inspectImage } from './core.js';
+import { containsSecret, inspectImage } from './core.js';
 import { inspectVideo } from './video.js';
 import { base64DecodedLength } from './base64.js';
 import { createMediaClient } from './adapters.js';
@@ -81,7 +81,7 @@ export async function generateMedia(request, context) {
     secret = await context.resolveCredential();
     if (typeof secret !== 'string' || secret.length < 1 || secret.length > 8192 || /[\r\n]/.test(secret)) fail('credential');
     // Reject a secret deliberately echoed through any public metadata/input field.
-    if (JSON.stringify({ request, cwd: store.cwd }).includes(secret)) fail('credential');
+    if (containsSecret({ request, cwd: store.cwd }, secret)) fail('credential');
     await store.recheck();
     await validateReferencePins(context.referencePins);
     checkAbort(signal);
@@ -139,7 +139,7 @@ export async function generateMedia(request, context) {
         await sleep(context.pollMs ?? 15_000, undefined, { signal });
       }
     }
-    if (Buffer.byteLength(JSON.stringify({ 'dsh-go/media': meta })) > 8192 || JSON.stringify(meta).includes(secret)) fail('metadata');
+    if (Buffer.byteLength(JSON.stringify({ 'dsh-go/media': meta })) > 8192 || containsSecret(meta, secret)) fail('metadata');
     await context.admission?.settle();
     await store.commit(meta, { sessionId: context.sessionId, createdAt });
     return { meta, text: 'AI 生成' + (request.model.kind === 'video' ? '视频' : '图片') + '已保存：\n' + meta.items.map(item => item.path).join('\n') };
@@ -149,9 +149,13 @@ export async function generateMedia(request, context) {
       try { cancelledRemote = await client.cancel(request, providerTask, secret, { signal: AbortSignal.timeout(20_000) }); }
       catch { cancelledRemote = 'unconfirmed'; }
     }
-    if (!submitted) await context.admission?.releaseUnsent();
-    const cleaned = store ? await store.abort().catch(() => false) : true;
-    if (!cleaned) throw new MediaError('cleanup_failed');
+    try {
+      if (!submitted) await context.admission?.releaseUnsent();
+    } finally {
+      // A failed ledger release must not leave the prepared store behind.
+      const cleaned = store ? await store.abort().catch(() => false) : true;
+      if (!cleaned) throw new MediaError('cleanup_failed');
+    }
     if (cancelledRemote === 'cancelled') fail('cancelled');
     if (signal.aborted && providerTask && cancelledRemote !== 'cancelled') fail('remote_may_continue');
     if (signal.aborted && submitted && !providerTask) fail('submission_unknown');

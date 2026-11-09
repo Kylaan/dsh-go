@@ -65,7 +65,8 @@ enum PetActivity {
 /// A running conversation (or subagent) on some host.
 @immutable
 class PetRun {
-  const PetRun(this.host, this.sessionId, {this.subagent = false, String? root, this.since}) : root = root ?? sessionId;
+  const PetRun(this.host, this.sessionId, {this.subagent = false, String? root, this.since, this.title})
+    : root = root ?? sessionId;
 
   final HostRef host;
   final String sessionId;
@@ -77,6 +78,9 @@ class PetRun {
   /// When it was last seen starting (the most recently active one wins).
   final DateTime? since;
 
+  /// The top-level conversation's title, unmasked; null until the host listed it.
+  final String? title;
+
   @override
   bool operator ==(Object other) =>
       other is PetRun &&
@@ -84,10 +88,11 @@ class PetRun {
       other.sessionId == sessionId &&
       other.subagent == subagent &&
       other.root == root &&
-      other.since == since;
+      other.since == since &&
+      other.title == title;
 
   @override
-  int get hashCode => Object.hash(host, sessionId, subagent, root, since);
+  int get hashCode => Object.hash(host, sessionId, subagent, root, since, title);
 }
 
 /// Something waiting on the person: an approval or a question.
@@ -126,6 +131,7 @@ class PetFocus {
   const PetFocus({
     required this.host,
     required this.sessionId,
+    this.title,
     this.activity = PetActivity.none,
     this.compacting = false,
     this.waitingKey,
@@ -134,6 +140,9 @@ class PetFocus {
 
   final HostRef host;
   final String sessionId;
+
+  /// The current chat state's title, before notification masking.
+  final String? title;
   final PetActivity activity;
   final bool compacting;
 
@@ -152,13 +161,14 @@ class PetFocus {
       other is PetFocus &&
       other.host == host &&
       other.sessionId == sessionId &&
+      other.title == title &&
       other.activity == activity &&
       other.compacting == compacting &&
       other.waitingKey == waitingKey &&
       other.waitingQuestion == waitingQuestion;
 
   @override
-  int get hashCode => Object.hash(host, sessionId, activity, compacting, waitingKey, waitingQuestion);
+  int get hashCode => Object.hash(host, sessionId, title, activity, compacting, waitingKey, waitingQuestion);
 }
 
 /// The level signals at one moment.

@@ -11,7 +11,8 @@ import '../notify/answer_native_request.dart';
 import '../notify/notify_channel.dart';
 import '../phone/phone_channel.dart';
 import '../phone/phone_approval.dart';
-import '../pets/pet_signals.dart' show petHearAlert, petOnScreenProvider;
+import '../companion/companion_state.dart';
+import '../pets/pet_signals.dart' show petHearAlert, petOnScreenProvider, petEventBusProvider;
 import 'app_info.dart';
 import 'bots_state.dart';
 import 'chat_state.dart';
@@ -36,6 +37,7 @@ class NotifyPrefs {
     this.failed = true,
     this.approval = true,
     this.question = true,
+    this.live = true,
     this.loaded = false,
   });
 
@@ -52,6 +54,9 @@ class NotifyPrefs {
 
   /// 向你提问.
   final bool question;
+
+  /// 实时活动: the status bar chip / island while DSH works (lib/notify/live_activity.dart).
+  final bool live;
   final bool loaded;
 
   bool allows(AlertKind kind) =>
@@ -63,15 +68,23 @@ class NotifyPrefs {
         AlertKind.question => question,
       };
 
-  NotifyPrefs copyWith({bool? enabled, bool? done, bool? failed, bool? approval, bool? question, bool? loaded}) =>
-      NotifyPrefs(
-        enabled: enabled ?? this.enabled,
-        done: done ?? this.done,
-        failed: failed ?? this.failed,
-        approval: approval ?? this.approval,
-        question: question ?? this.question,
-        loaded: loaded ?? this.loaded,
-      );
+  NotifyPrefs copyWith({
+    bool? enabled,
+    bool? done,
+    bool? failed,
+    bool? approval,
+    bool? question,
+    bool? live,
+    bool? loaded,
+  }) => NotifyPrefs(
+    enabled: enabled ?? this.enabled,
+    done: done ?? this.done,
+    failed: failed ?? this.failed,
+    approval: approval ?? this.approval,
+    question: question ?? this.question,
+    live: live ?? this.live,
+    loaded: loaded ?? this.loaded,
+  );
 }
 
 class NotifyPrefsController extends Notifier<NotifyPrefs> {
@@ -81,6 +94,7 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
     failed: 'notify_failed',
     approval: 'notify_approval',
     question: 'notify_question',
+    live: 'notify_live',
   );
 
   late Future<void> _loaded;
@@ -100,6 +114,7 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
         failed: prefs.getBool(_keys.failed) ?? true,
         approval: prefs.getBool(_keys.approval) ?? true,
         question: prefs.getBool(_keys.question) ?? true,
+        live: prefs.getBool(_keys.live) ?? true,
         loaded: true,
       );
     } catch (_) {
@@ -125,6 +140,7 @@ class NotifyPrefsController extends Notifier<NotifyPrefs> {
   Future<void> setFailed(bool v) => _save(_keys.failed, v, (s) => s.copyWith(failed: v));
   Future<void> setApproval(bool v) => _save(_keys.approval, v, (s) => s.copyWith(approval: v));
   Future<void> setQuestion(bool v) => _save(_keys.question, v, (s) => s.copyWith(question: v));
+  Future<void> setLive(bool v) => _save(_keys.live, v, (s) => s.copyWith(live: v));
 }
 
 final notifyPrefsProvider = NotifierProvider<NotifyPrefsController, NotifyPrefs>(NotifyPrefsController.new);
@@ -445,7 +461,16 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
 
   void _attach(HostRef host, HostConnection? connection) {
     final current = _trackers[host];
-    if (current != null && identical(current.$1.client, connection?.client)) return;
+    if (current != null && identical(current.$1, connection)) return;
+    if (current != null &&
+        connection != null &&
+        identical(current.$1.client, connection.client) &&
+        current.$2.updateCompanionConnection(previous: current.$1, next: connection)) {
+      // A name/cwd refresh wraps the same live client. Keep its pending scopes,
+      // phone card and alert history; future metadata uses the new wrapper.
+      _trackers[host] = (connection, current.$2);
+      return;
+    }
     if (current != null) {
       _cancelPhonePrompt(host: host);
       _trackers.remove(host);
@@ -453,15 +478,38 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
     }
     if (connection == null) return;
     final timing = ref.read(alertTimingProvider);
-    final tracker = HostAlertTracker(
+    final scope = ref, lifetime = _lifetime;
+    late final HostAlertTracker tracker;
+    bool attached() =>
+        scope.mounted &&
+        identical(_lifetime, lifetime) &&
+        identical(_trackers[host]?.$1.client, connection.client) &&
+        identical(_trackers[host]?.$2, tracker);
+    tracker = HostAlertTracker(
       host: host,
       source: ref.read(alertSourceFactoryProvider)(connection),
-      onAlert: _onAlert,
-      onWithdraw: _onWithdraw,
-      onSessionGone: _onSessionGone,
-      onReannounce: (alert) => _offerPhonePrompt(alert),
-      onRequestEpochChanged: (host) => _cancelPhonePrompt(host: host),
-      skipApproval: (sessionId) => ref.exists(chatProvider(sessionId)) && ref.read(chatProvider(sessionId)).autoApprove,
+      onAlert: (alert) {
+        if (attached()) _onAlert(alert);
+      },
+      onWithdraw: (host, session, key) {
+        if (attached()) _onWithdraw(host, session, key);
+      },
+      onSessionGone: (host, session) {
+        if (attached()) _onSessionGone(host, session);
+      },
+      onReannounce: (alert) {
+        if (attached()) _offerPhonePrompt(alert);
+      },
+      onRequestEpochChanged: (host) {
+        if (attached()) _cancelPhonePrompt(host: host);
+      },
+      companionConnection: connection,
+      isCompanionAttached: attached,
+      onCompanionSignal: (delivery) {
+        if (attached()) scope.read(petEventBusProvider).companionSignal(delivery);
+      },
+      skipApproval: (sessionId) =>
+          attached() && scope.exists(chatProvider(sessionId)) && scope.read(chatProvider(sessionId)).autoApprove,
       announceDelay: timing.announce,
       reconcileDelay: timing.reconcile,
     );
@@ -664,6 +712,10 @@ class ChatAlertsController extends Notifier<ChatAlert?> {
   void _deliver(ChatAlert alert) {
     // DS Bot's own conversations: it sends its own notifications.
     if (ref.read(dsBotSessionFilterProvider)(alert.host, alert.sessionId)) return;
+    // The companion's reply is on her page; it isn't a finished task. A request
+    // that really waits on the person (an older host's preset has tools) still
+    // goes through.
+    if (!alert.kind.attention && ref.read(companionSessionFilterProvider)(alert.host, alert.sessionId)) return;
     final prefs = ref.read(notifyPrefsProvider);
     final foreground = ref.read(appForegroundProvider);
     final delivery = deliveryFor(

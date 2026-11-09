@@ -45,6 +45,67 @@ class GuestAgentsModeTest {
         } finally { root.deleteRecursively() }
     }
 
+    @Test fun diagnosticsSectionNamesThePathForEachLaunchMode() {
+        val root = kotlin.io.path.createTempDirectory("agents-diagnostics").toFile()
+        try {
+            val file = File(root, "root/.dsh/AGENTS.md")
+            GuestSetup.writeAgentsMd(root, phoneStorage = false)
+            val proot = file.readText()
+            assertTrue(proot.contains("## 本机诊断"))
+            assertTrue(proot.contains("`\$DSH_HOME/dsh-app/diagnostics.md`"))
+            assertTrue(proot.contains("dsh-go-support"))
+            GuestSetup.writeAgentsMd(root, phoneStorage = false, directEngine = true)
+            val direct = file.readText()
+            assertTrue(direct.contains("`${root.canonicalPath}/root/.dsh/dsh-app/diagnostics.md`"))
+            assertFalse(direct.contains("\$DSH_HOME/dsh-app/diagnostics.md"))
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test fun diagnosticsSnapshotIsWrittenWhereTheEngineCanReadIt() {
+        val root = kotlin.io.path.createTempDirectory("agents-write").toFile()
+        try {
+            val file = GuestSetup.writeDiagnostics(root, "# first\n")
+            assertEquals(File(root, "root/.dsh/dsh-app/diagnostics.md").absoluteFile, file.absoluteFile)
+            assertEquals("# first\n", file.readText())
+            GuestSetup.writeDiagnostics(root, "# second\n")
+            assertEquals("# second\n", file.readText())
+            assertEquals(0, file.parentFile!!.listFiles()!!.count { it.name.startsWith(".diagnostics") })
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test fun safeDiagnosticsLeaveOriginalHomeUntouchedAndNormalDiagnosticsReturnToIt() {
+        val root = kotlin.io.path.createTempDirectory("diagnostics-safe").toFile()
+        try {
+            val original = GuestSetup.writeDiagnostics(root, "# original\n")
+            val originalBytes = original.readBytes()
+            val safeFile = GuestSetup.writeDiagnostics(root, "# rescue\n", safe = true)
+            assertEquals(
+                File(root, "var/lib/dsh-app/safe-mode/home/dsh-app/diagnostics.md").absoluteFile,
+                safeFile.absoluteFile,
+            )
+            assertEquals("# rescue\n", safeFile.readText())
+            assertArrayEquals(originalBytes, original.readBytes())
+            val normalFile = GuestSetup.writeDiagnostics(root, "# normal again\n")
+            assertEquals(original.absoluteFile, normalFile.absoluteFile)
+            assertEquals("# normal again\n", original.readText())
+            assertEquals("# rescue\n", safeFile.readText())
+        } finally { root.deleteRecursively() }
+    }
+
+    @Test fun safeDiagnosticsDoNotNeedTheOriginalHomeToBeADirectory() {
+        val root = kotlin.io.path.createTempDirectory("diagnostics-broken-home").toFile()
+        try {
+            val originalHome = File(root, "root/.dsh")
+            originalHome.parentFile.mkdirs()
+            val originalBytes = "original path is not a directory\n".toByteArray()
+            originalHome.writeBytes(originalBytes)
+            val safeFile = GuestSetup.writeDiagnostics(root, "# rescue\n", safe = true)
+            assertEquals("# rescue\n", safeFile.readText())
+            assertArrayEquals(originalBytes, originalHome.readBytes())
+            assertEquals(0, safeFile.parentFile!!.listFiles()!!.count { it.name.startsWith(".diagnostics") })
+        } finally { root.deleteRecursively() }
+    }
+
     @Test fun unchangedDefaultStartupDoesNotRewriteAnExistingManagedFile() {
         val root = kotlin.io.path.createTempDirectory("agents-unchanged").toFile()
         try {

@@ -5,7 +5,9 @@
 // the composer or does what the capsule says; nothing is ever sent by it. The
 // row steps aside while a reply is generating (the activity strip takes the
 // place). Last, outside the eight, 「插件」 opens the conversation's plugin
-// sheet (chat_plugins_sheet.dart) while it has something.
+// sheet (chat_plugins_sheet.dart) while it has something. The chat's own
+// pills (「自动允许中」, 「完全权限」, the generation mode) lead the row, pinned
+// while the capsules scroll: one row above the composer, not two.
 
 import 'dart:async';
 
@@ -19,7 +21,6 @@ import '../../../plugins/native/native_state.dart';
 import '../../../ui_config/ui_config_model.dart';
 import '../../../ui_config/ui_config_state.dart';
 import '../../common/edge_fade.dart';
-import '../../common/pressable.dart';
 import '../../pets/pet_perch.dart';
 import '../../theme/app_icons.dart';
 import '../../theme/theme.dart';
@@ -95,48 +96,45 @@ class ComposerCapsule extends ConsumerWidget {
           ? null
           : l10n.plugslotsFromPlugin(source),
       excludeSemantics: true,
-      child: Pressable(
-        enabled: !busy || cancel != null,
-        child: GlassSurface(
-          tier: GlassTier.chrome,
-          stadium: true,
-          grouped: true,
-          onTap: busy ? cancel : item.onTap,
-          child: SizedBox(
-            height: CapsuleMetrics.height,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                AnimatedOpacity(
-                  opacity: busy ? 0 : 1,
-                  duration: duration,
-                  child: Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: CapsuleMetrics.inset),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        if (item.icon case final icon?) ...[
-                          Icon(icon, size: CapsuleMetrics.icon, color: colors.onSurfaceVariant),
-                          const SizedBox(width: CapsuleMetrics.iconGap),
-                        ],
-                        Text(item.label, maxLines: 1, softWrap: false, style: style),
+      child: GlassSurface(
+        tier: GlassTier.chrome,
+        stadium: true,
+        grouped: true,
+        onTap: busy ? cancel : item.onTap,
+        child: SizedBox(
+          height: CapsuleMetrics.height,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              AnimatedOpacity(
+                opacity: busy ? 0 : 1,
+                duration: duration,
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: CapsuleMetrics.inset),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      if (item.icon case final icon?) ...[
+                        Icon(icon, size: CapsuleMetrics.icon, color: colors.onSurfaceVariant),
+                        const SizedBox(width: CapsuleMetrics.iconGap),
                       ],
-                    ),
+                      Text(item.label, maxLines: 1, softWrap: false, style: style),
+                    ],
                   ),
                 ),
-                AnimatedOpacity(
-                  opacity: busy ? 1 : 0,
-                  duration: duration,
-                  child: SizedBox.square(
-                    key: busy ? const ValueKey('capsule-ring') : null,
-                    dimension: ring,
-                    child: busy
-                        ? CircularProgressIndicator(strokeWidth: 1.6, color: colors.onSurfaceVariant)
-                        : const SizedBox.shrink(),
-                  ),
+              ),
+              AnimatedOpacity(
+                opacity: busy ? 1 : 0,
+                duration: duration,
+                child: SizedBox.square(
+                  key: busy ? const ValueKey('capsule-ring') : null,
+                  dimension: ring,
+                  child: busy
+                      ? CircularProgressIndicator(strokeWidth: 1.6, color: colors.onSurfaceVariant)
+                      : const SizedBox.shrink(),
                 ),
-              ],
-            ),
+              ),
+            ],
           ),
         ),
       ),
@@ -150,11 +148,15 @@ class ComposerCapsule extends ConsumerWidget {
 /// The first capsule lines up with the composer's edge, but the scrolling
 /// band reaches [bleed] further on each side (the screen's gutter) and
 /// [shadowRoom] above and below, so the glass shadows are never cut and
-/// capsules slide out under the screen's edge, not the composer's.
+/// capsules slide out under the screen's edge, not the composer's. A
+/// [leading] widget stays put at the left; the band starts after it.
 class ComposerCapsuleRow extends StatelessWidget {
-  const ComposerCapsuleRow({super.key, required this.items, this.bleed = 12});
+  const ComposerCapsuleRow({super.key, required this.items, this.leading, this.bleed = 12});
 
   final List<CapsuleItem> items;
+
+  /// Pinned before the capsules (the chat's pills), centred on the row.
+  final Widget? leading;
 
   /// How far the band reaches past the row on each side.
   final double bleed;
@@ -164,37 +166,52 @@ class ComposerCapsuleRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final leading = this.leading;
     return Padding(
       padding: const EdgeInsets.only(bottom: CapsuleMetrics.below),
       child: SizedBox(
         height: CapsuleMetrics.height,
-        child: LayoutBuilder(
-          builder: (context, constraints) => OverflowBox(
-            minWidth: constraints.maxWidth + 2 * bleed,
-            maxWidth: constraints.maxWidth + 2 * bleed,
-            minHeight: CapsuleMetrics.height + 2 * shadowRoom,
-            maxHeight: CapsuleMetrics.height + 2 * shadowRoom,
-            child: BackdropGroup(
-              child: HorizontalEdgeFade(
-                child: SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  padding: EdgeInsets.symmetric(horizontal: bleed, vertical: shadowRoom),
-                  child: Row(
-                    children: [
-                      for (final (i, item) in items.indexed) ...[
-                        if (i > 0) const SizedBox(width: CapsuleMetrics.gap),
-                        ComposerCapsule(key: ValueKey(item.id), item: item),
-                      ],
-                    ],
-                  ),
-                ),
+        child: leading == null
+            ? _band(left: bleed)
+            : Row(
+                children: [
+                  leading,
+                  if (items.isNotEmpty) ...[
+                    const SizedBox(width: CapsuleMetrics.gap),
+                    // Under the pinned pills nothing slides: the band starts here.
+                    Expanded(child: _band(left: 0)),
+                  ],
+                ],
               ),
+      ),
+    );
+  }
+
+  Widget _band({required double left}) => LayoutBuilder(
+    builder: (context, constraints) => OverflowBox(
+      alignment: left == bleed ? Alignment.center : Alignment.centerLeft,
+      minWidth: constraints.maxWidth + left + bleed,
+      maxWidth: constraints.maxWidth + left + bleed,
+      minHeight: CapsuleMetrics.height + 2 * shadowRoom,
+      maxHeight: CapsuleMetrics.height + 2 * shadowRoom,
+      child: BackdropGroup(
+        child: HorizontalEdgeFade(
+          child: SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: EdgeInsets.fromLTRB(left, shadowRoom, bleed, shadowRoom),
+            child: Row(
+              children: [
+                for (final (i, item) in items.indexed) ...[
+                  if (i > 0) const SizedBox(width: CapsuleMetrics.gap),
+                  ComposerCapsule(key: ValueKey(item.id), item: item),
+                ],
+              ],
             ),
           ),
         ),
       ),
-    );
-  }
+    ),
+  );
 }
 
 /// The capsules of the composer on screen, in order: ui.json's (commands
@@ -229,29 +246,34 @@ List<CapsuleItem> composerCapsules(
 }
 
 /// The row on the chat screen. [visible] false (a reply generating, read
-/// only) folds it away; with no capsules at all it takes no room.
+/// only) folds it away; with no capsules and no [leading] it takes no room.
 class ComposerCapsuleBar extends ConsumerStatefulWidget {
-  const ComposerCapsuleBar({super.key, required this.sessionId, required this.visible});
+  const ComposerCapsuleBar({super.key, required this.sessionId, required this.visible, this.leading});
 
   final String? sessionId;
   final bool visible;
+
+  /// See [ComposerCapsuleRow.leading].
+  final Widget? leading;
 
   @override
   ConsumerState<ComposerCapsuleBar> createState() => _ComposerCapsuleBarState();
 }
 
 class _ComposerCapsuleBarState extends ConsumerState<ComposerCapsuleBar> {
-  /// The last capsules shown: they stay while the row folds away.
+  /// The last capsules and pills shown: they stay while the row folds away.
   List<CapsuleItem> _last = const [];
+  Widget? _lastLeading;
 
   @override
   Widget build(BuildContext context) {
     final quick = ref.watch(uiOverridesProvider.select((o) => o.config.quickActions)) ?? const <UiQuickAction>[];
     final plugins = ref.watch(nativeComposerActionsProvider);
+    final hidePluginCapsule = ref.watch(uiHiddenProvider(UiHideItem.pluginCapsule));
     final session = widget.sessionId;
     final items = [
       ...composerCapsules(context, ref, sessionId: session, quick: quick, plugins: plugins),
-      if (session != null && ref.watch(chatPluginsHaveContentProvider(session)))
+      if (!hidePluginCapsule && session != null && ref.watch(chatPluginsHaveContentProvider(session)))
         CapsuleItem(
           id: chatPluginsCapsuleId,
           label: context.l10n.plugslotsChatEntry,
@@ -259,18 +281,22 @@ class _ComposerCapsuleBarState extends ConsumerState<ComposerCapsuleBar> {
           onTap: () => unawaited(showChatPluginsSheet(context, sessionId: session)),
         ),
     ];
-    if (items.isNotEmpty) _last = items;
-    final open = widget.visible && items.isNotEmpty;
+    final leading = widget.leading;
+    final open = widget.visible && (items.isNotEmpty || leading != null);
+    if (open) {
+      _last = items;
+      _lastLeading = leading;
+    }
     return RiseReveal(
       open: open,
-      child: _last.isEmpty
+      child: _last.isEmpty && _lastLeading == null
           ? const SizedBox(width: double.infinity)
           // The chat page's pet stands on the row's top edge, above the
           // capsules (never on them); not while the row sinks.
           : PetPerch(
               kind: PerchKind.plugin,
               active: open,
-              child: ComposerCapsuleRow(items: _last),
+              child: ComposerCapsuleRow(items: _last, leading: _lastLeading),
             ),
     );
   }

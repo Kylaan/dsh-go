@@ -40,7 +40,10 @@ enum SpotCondition {
   engineField,
 
   /// Only with a conversation open.
-  openChat;
+  openChat,
+
+  /// Only with animations on.
+  animationsOn;
 
   String label(L10n l10n) => switch (this) {
     localHost => l10n.searchNeedsLocal,
@@ -48,6 +51,7 @@ enum SpotCondition {
     nativeUi => l10n.searchNeedsNativeUi,
     engineField => l10n.searchNeedsEngineField,
     openChat => l10n.searchNeedsChat,
+    animationsOn => l10n.searchNeedsAnimations,
   };
 }
 
@@ -774,6 +778,24 @@ abstract final class Spots {
     title: (l) => l.hubInterfaceHome,
     keywords: (l) => l.searchKwUiMode,
   );
+  static final hardwareEnterSends = SettingSpot(
+    'hardware-enter-sends',
+    page: SettingsPageId.interface,
+    title: (l) => l.hubHardwareEnterSends,
+    keywords: (l) => l.hubHardwareEnterSendsHint,
+  );
+  static final quickPanel = SettingSpot(
+    'quick-panel',
+    page: SettingsPageId.interface,
+    title: (l) => l.hubQuickPanel,
+    keywords: (l) => l.searchKwQuickPanel,
+  );
+  static final tableTint = SettingSpot(
+    'table-tint',
+    page: SettingsPageId.interface,
+    title: (l) => l.hubTableTint,
+    keywords: (l) => l.searchKwTableTint,
+  );
   static final webApp = SettingSpot(
     'web-app',
     page: SettingsPageId.interface,
@@ -820,6 +842,12 @@ abstract final class Spots {
   );
 
   // 性能.
+  static final refreshRate = SettingSpot(
+    'refresh-rate',
+    page: SettingsPageId.performance,
+    title: (l) => l.performanceRefresh,
+    keywords: (l) => l.searchKwRefreshRate,
+  );
   static final blur = SettingSpot(
     'blur',
     page: SettingsPageId.performance,
@@ -831,6 +859,13 @@ abstract final class Spots {
     page: SettingsPageId.performance,
     title: (l) => l.performanceAnimations,
     keywords: (l) => l.searchKwAnimations,
+  );
+  static final fluidMotion = SettingSpot(
+    'fluid-motion',
+    page: SettingsPageId.performance,
+    title: (l) => l.performanceFluid,
+    keywords: (l) => l.searchKwFluidMotion,
+    condition: SpotCondition.animationsOn,
   );
 
   // 通知.
@@ -863,6 +898,12 @@ abstract final class Spots {
     page: SettingsPageId.notifications,
     title: (l) => l.pluginsQuestions,
     keywords: (l) => l.searchKwNotifyQuestion,
+  );
+  static final notifyLive = SettingSpot(
+    'notify-live',
+    page: SettingsPageId.notifications,
+    title: (l) => l.liveSettingsSwitch,
+    keywords: (l) => l.searchKwNotifyLive,
   );
   static final notifySystem = SettingSpot(
     'notify-system',
@@ -914,6 +955,13 @@ abstract final class Spots {
     altTitle: (l) => l.phoneSafeLeave,
     keywords: (l) => l.searchKwSafeMode,
   );
+  static final workspaceRecovery = SettingSpot(
+    'workspace-recovery',
+    page: SettingsPageId.engine,
+    title: (l) => l.workspaceRecoveryEnable,
+    altTitle: (l) => l.workspaceRecoveryDisable,
+    keywords: (l) => l.searchKwWorkspaceRecovery,
+  );
   static final engineReset = SettingSpot(
     'engine-reset',
     page: SettingsPageId.engine,
@@ -939,6 +987,13 @@ abstract final class Spots {
     page: SettingsPageId.remote,
     title: (l) => l.remoteAutoConnectOnStartup,
     keywords: (l) => l.searchKwRemoteAutoConnect,
+  );
+
+  static final remoteCompactHistory = SettingSpot(
+    'remote-compact-history',
+    page: SettingsPageId.remote,
+    title: (l) => l.remoteCompactHistory,
+    keywords: (l) => l.searchKwRemoteCompactHistory,
   );
 
   // 引擎参数 and its pages (drawn from the engine's schema).
@@ -1031,19 +1086,25 @@ final _rows = <SettingSpot>[
   Spots.petOutsideApp,
   Spots.petDisplayWhen,
   Spots.uiMode,
+  Spots.hardwareEnterSends,
+  Spots.quickPanel,
+  Spots.tableTint,
   Spots.webApp,
   Spots.openWeb,
   Spots.webPhoneLayout,
   Spots.webCodingView,
   Spots.webCollapse,
   Spots.webBusySend,
+  Spots.refreshRate,
   Spots.blur,
   Spots.animations,
+  Spots.fluidMotion,
   Spots.notifyEnabled,
   Spots.notifyDone,
   Spots.notifyFailed,
   Spots.notifyApproval,
   Spots.notifyQuestion,
+  Spots.notifyLive,
   Spots.notifySystem,
   Spots.shareConfig,
   Spots.usageStats,
@@ -1051,10 +1112,12 @@ final _rows = <SettingSpot>[
   Spots.autoStart,
   Spots.autoSafe,
   Spots.safeMode,
+  Spots.workspaceRecovery,
   Spots.engineReset,
   Spots.engineUninstall,
   Spots.addSshHost,
   Spots.remoteAutoConnect,
+  Spots.remoteCompactHistory,
   Spots.subagentDepth,
   Spots.parallelCalls,
   Spots.commandTimeout,

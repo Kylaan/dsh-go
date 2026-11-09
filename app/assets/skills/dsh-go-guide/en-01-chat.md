@@ -15,14 +15,16 @@ With a hardware keyboard, Enter adds a line break and Ctrl+Enter or ⌘+Enter se
 
 ## Choose a model
 
-Tap the model capsule at the top right to open **Choose model**. Tap a model to switch right away; if it supports levels, pick one under **Thinking effort**. Typing `/model` in the composer opens it too. **Manage models** at the bottom goes straight to the models page in Settings; to add and manage models, see [Models and providers](02-models.md).
+On a phone, tap into the composer, then tap the model under it. On a tablet or wider screen, tap the model capsule at the top right. Either way opens **Choose model**. Tap a model to switch right away; if it supports levels, pick one under **Thinking effort**. Typing `/model` in the composer opens it too. **Manage models** at the bottom goes straight to the models page in Settings; to add and manage models, see [Models and providers](02-models.md).
 
 ## Images, files and voice
 
 Tap the plus button next to the composer and choose **Photos**, **Take photo** or **File**. You can attach up to 9 items per message. Under **This chat** in the same panel you can change this chat's **Permissions** and turn **Plan mode** on or off; while phone control is on, **Confirmation** is there too.
 
-- On a host connected through DSH Remote, you can send images only.
+- On DSH Remote, **File** appears when the host's Remote plugin supports uploads. The app adds no separate 20 MB limit; the normal 200 MB attachment limit still applies. The host decides whether it can accept the file based on its plugin version and current network path (Relay/TURN typically allow up to 20 MB). Files are uploaded in chunks to the current chat's working directory when you send. Existing files are never overwritten; the host assigns a new name on collision. If an upload fails, the question is not sent. Older hosts accept images only; update their Remote plugin and reconnect.
 - If the current model can't view images, they're sent to the AI as files. Switch to a model that can view images to let the AI see them.
+
+Tap an image to view it full screen. Pinch to zoom in or out, up to 8x; double-tap to zoom to 2.5x around the touch point, then double-tap again to fit. Swipe left or right through images in the same attachment group, reply or tool output; the page count is shown. Workspace and web images in a reply form separate groups. While zoomed in, dragging pans the picture instead of turning pages; return to fit before swiping. Save and the long-press menu apply to the current picture.
 
 When the composer is empty and speech recognition is available, the send button becomes a microphone. Tap it and speak; your words fill the composer so you can check them before sending. When the recognition service isn't available, **Change** on the notice opens the voice input settings.
 
@@ -32,7 +34,7 @@ When the current host has the image and video plugin, the plus panel has a **Cre
 
 Add reference images from the plus panel as usual. For video, the first image is the **First** frame and the second the **Last** frame.
 
-Created images appear in the chat with a line that says **AI-generated**, the model and the aspect, plus an estimated cost when the price is reliable. Tap an image to view it full screen and swipe through the batch. Under the images you can save to Photos, share or **Regenerate**; More has **Edit**, **Copy prompt** and **Details**. When a description doesn't pass content review, tap **Revise** on the card to get it back in the composer. Videos open in another app for now.
+Created images appear in the chat with a line that says **AI-generated**, the model and the aspect, plus an estimated cost when the price is reliable. Tap an image to view it full screen and swipe through the batch. Under the images you can save to Photos, share or **Regenerate**; More has **Edit**, **Copy prompt** and **Details**. When a description doesn't pass content review, tap **Revise** on the card to get it back in the composer. If an image fails to load, **Reload image** reads the file again without generating again or incurring generation charges. Tap a video for in-App playback, pause and seeking; opening in another app remains available if playback fails. Images and videos can both be saved to the gallery. Local videos without a poster get a first-frame preview; remote videos download only when you open them, never just for scrolling previews.
 
 If the host doesn't have the plugin yet, **Create** offers **Install on this host**. Services and API keys are set under Capabilities in [Settings](10-settings.md).
 
@@ -65,7 +67,15 @@ Question cards: pick an answer, or tap **Other answer** to write your own, then 
 
 Approval cards: check the command, files and reason, then tap **Allow once** or **Decline**.
 
-**Allow for chat** approves everything for the rest of this chat, including requests already waiting. **Auto-approving** appears above the composer; tap it to turn it off. Approvals are asked again after the app restarts. A chat with **Full access** or **Auto review** also shows a capsule above the composer; tap it to change the chat's permissions. To skip approvals in all new chats on this phone's engine, set the new-chat default to **Full access** under Permissions in [Settings](10-settings.md).
+**Allow for chat** approves ordinary tool approvals for the rest of this chat, including requests already waiting. **Auto-approving** appears above the composer; tap it to turn it off. Approvals are asked again after the app restarts. A chat with **Full access** or **Auto review** also shows a capsule above the composer; tap it to change the chat's permissions. To skip approvals in all new chats on this phone's engine, set the new-chat default to **Full access** under Permissions in [Settings](10-settings.md).
+
+### Separate authorization for scheduled tasks
+
+With the patched bundled engine, creating a task or changing its name, instructions or timing requires a separate confirmation. The question shows the complete instructions, rule, time zone and resolved trigger time. Review them, select "授权 / Authorize", then submit. Full access, Auto review and chat-wide auto-approval cannot replace this confirmation. While saving in the task editor, the confirmation appears there; tasks requested in a chat are confirmed in that chat.
+
+Rejection, no answer, a two-minute authorization timeout or an unavailable confirmation interface does not save the change. A trigger time that has already passed must be proposed and confirmed again. A rejected edit leaves the existing task unchanged. Cancelling a save, leaving the editor or switching hosts attempts to reject that page's outstanding requests; it cannot undo an operation another client already confirmed first.
+
+Authorization covers only the displayed task, not arbitrary future actions. It does not reduce the target chat's permissions or replace system isolation of credentials and tool execution. Existing tasks are not retrospectively authorized; inspect them and delete any you do not recognize. Remote hosts need the same engine fix: updating only the phone UI does not enforce authorization on an unpatched remote engine.
 
 ## Copy, quote and regenerate
 
@@ -80,11 +90,25 @@ Touch and hold your own message for **Copy**, **Select text** and **Edit and res
 
 ## Organize the chat list
 
-Touch and hold a chat for **Pin**, **Rename**, **Move to folder**, **Share**, **Select** and **Archive**.
+Touch and hold a chat for **Pin**, **Rename**, **Move to folder**, **Share**, **Select**, **Archive** and **Delete permanently**.
 
 - **Archive** stops a turn in progress. Tap **Undo** on the notice within 4 seconds to keep the chat as it was, turn included; leaving the app archives it at once.
-- Chats can't be deleted; archiving removes them from the list. To get one back, tap **Search chats**, find it and tap **Restore and open**.
+- **Delete permanently** removes the chat record from this host and cannot be undone — unlike archive. The working folder, generated files, branched chats, shared attachments and published cloud shares stay; delete cloud shares separately.
+- Deletion asks for confirmation first. A running chat must be stopped; the host also refuses while a chat has subagents, related jobs or reminders. It needs a host that supports it: on an older host the action says so and archive stays the only option — it never falls back to archive silently.
+- After selecting several chats, **Delete** in the action bar removes them in one go; failures are listed one by one and only acknowledged chats leave the list. If the connection drops and the result is unconfirmed, the rest of the batch stops — refresh the list before deciding.
+- To get an archived chat back, tap **Search chats**, find it and tap **Restore and open**.
 - Filter the list with **All**, **Running**, **Pending** and **Unread**. The ⋯ at the end of the workspace row sorts by **Recent activity** or **Date created**, and has **New folder** and **Manage folders**.
+
+## Swipe-left shortcuts
+
+<!-- nav: commonSettings,hubSettingsInterface,hubQuickPanel -->
+`Settings › Interface › Swipe-left shortcuts`
+
+Swipe right to left over the chat and **Shortcuts** slides in from the right; tap one to open that page. It starts with **Plugins**, **Local engine** and **Settings**. Swiping on code blocks, tables and other content that scrolls sideways still scrolls them. Back closes the panel first.
+
+You can turn off **Open with a left swipe**, and under **What it lists** tick what to show and drag to reorder. There's no swipe while the chat list stays open at the side.
+
+With a conversation open, the panel is about that conversation, in two parts, **Info** and **Plugins**: Info has the whole title, workspace, model and host, with the full page a tap away at the top right; Plugins has every plugin panel, switched along its top when there are several. The shortcuts you ticked sit along the bottom. On a phone the header has no model chip, with the status and workspace under the title, and while you type, the composer shows the model and thinking depth at its foot: tap them to change, or use Overview.
 
 ## Hardware keyboard
 

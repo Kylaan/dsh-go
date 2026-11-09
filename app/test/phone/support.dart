@@ -60,6 +60,70 @@ Map<String, Object?> phoneStatus({
   'device': ?device,
 };
 
+/// [phoneStatus] from a native module with the versioned five-channel block
+/// (`background.privileged` v1, `background.root`, the shared API's source),
+/// the old fields projected as it projects them: Sui is Shizuku, root is off.
+Map<String, Object?> privilegedStatus({
+  String mode = 'off',
+  bool ready = false,
+  String? reason,
+  String recommended = 'off',
+  String grantPath = 'setup',
+  bool? rootSelected,
+  String? provider,
+  bool shizukuApp = false,
+  bool running = false,
+  bool granted = false,
+  Map<String, Object?> root = const {},
+  bool? wirelessDebugging = false,
+  bool paired = false,
+  bool adbConnected = false,
+  bool androidOk = true,
+  bool enabled = true,
+  Map<String, Object?>? keep,
+}) {
+  final base = phoneStatus(
+    enabled: enabled,
+    androidOk: androidOk,
+    wirelessDebugging: wirelessDebugging,
+    paired: paired,
+    adbConnected: adbConnected,
+  );
+  final legacy = switch (mode) {
+    'sui' => 'shizuku',
+    'root' => 'off',
+    _ => mode,
+  };
+  return {
+    ...base,
+    'background': {
+      ...(base['background'] as Map).cast<String, Object?>(),
+      'mode': legacy,
+      'ready': ready && legacy != 'off',
+      'reason': reason,
+      'shizuku': {
+        'installed': shizukuApp || provider != null,
+        'appInstalled': shizukuApp,
+        'running': running,
+        'granted': granted,
+        'provider': provider,
+      },
+      'root': {'checked': false, 'available': null, 'connected': false, 'starting': false, 'reasonCode': null, ...root},
+      'privileged': {
+        'v': 1,
+        'mode': mode,
+        'ready': ready,
+        'reason': reason,
+        'supportedModes': const ['off', 'shizuku', 'sui', 'root', 'adb'],
+        'recommendedMode': recommended,
+        'grantPath': grantPath,
+        'rootSelected': rootSelected ?? mode == 'root',
+        'keep': ?keep,
+      },
+    },
+  };
+}
+
 Map<String, Object?> defaultPolicies() => {
   'denyPackages': ['com.eg.android.AlipayGphone', 'com.unionpay', 'cmb.pb', 'com.icbc'],
   'confirmEveryWritePackages': ['com.tencent.mm'],
@@ -116,8 +180,15 @@ class FakePhoneNative {
   List<Map<String, Object?>> log;
   Map<String, Object?> screen = {'ok': true, 'text': sampleScreenText};
 
+  /// Optional barriers for settings writes and their subsequent real channel readback.
+  Future<Map<String, Object?>?> Function()? onStatus;
+  Future<Map<String, Object?>> Function(Map<String, Object?>)? onSetBackgroundParallelLimit;
+
   /// Reply of `setEnabled` / `setPolicies`.
   bool accept = true;
+
+  Future<Map<String, Object?>?> Function()? onGetPolicies;
+  Future<bool> Function(Map<String, Object?>)? onSetPolicies;
 
   /// Reply of `finishTask`; null: closed, and back in the app exactly when asked to reopen.
   Map<String, Object?>? finish;
@@ -127,6 +198,12 @@ class FakePhoneNative {
 
   /// Private engine-approval UI; production PhoneChannel still encodes/parses.
   Future<Map<String, Object?>> Function(Map<String, Object?>)? onPresentPrompt;
+
+  /// Gate cleanup's asynchronous native response, without rerunning a probe.
+  Future<Map<String, Object?>> Function(Map<String, Object?>)? onRetryGateCleanup;
+
+  Future<bool> Function(String)? onAcknowledgeInterruption;
+  Future<bool> Function()? onRetryInterruption;
 
   /// The 悬浮条 settings as the native side keeps them.
   Map<String, Object?> overlay = {'idleOpacity': 0.7, 'autoCollapse': false};
@@ -180,26 +257,56 @@ class FakePhoneNative {
     final args = call.arguments is Map ? (call.arguments as Map).cast<String, Object?>() : const <String, Object?>{};
     switch (call.method) {
       case 'status':
-        return status;
+        return onStatus?.call() ?? status;
       case 'setEnabled':
         if (accept) status = {...status, 'enabled': args['enabled']};
         return accept;
-      case 'openAccessibilitySettings' || 'openAppDetails' || 'stopTask':
+      case 'openAccessibilitySettings' || 'openAppDetails' || 'stopTask' || 'resumeTask' || 'retryTaskCleanup':
         return true;
+      case 'acknowledgeTaskInterruption':
+        return onAcknowledgeInterruption?.call(args['batchToken'] as String) ?? false;
+      case 'retryTaskInterruptionStorage':
+        return onRetryInterruption?.call() ?? false;
       case 'testScreen':
         return screen;
+      case 'setBackgroundViewport':
+        final viewportResult = results[call.method] ?? {'ok': true};
+        if (viewportResult['ok'] == true) {
+          status = {...status, 'background': {..._background, 'viewport': {'v': 1, 'preset': args['preset']}}};
+        }
+        return viewportResult;
+      case 'setBackgroundParallelLimit':
+        if (onSetBackgroundParallelLimit != null) return onSetBackgroundParallelLimit!(args);
+        final capacityResult = results[call.method] ?? {'ok': true};
+        if (capacityResult['ok'] == true) {
+          final old = (_background['parallelism'] as Map).cast<String, Object?>();
+          final limit = args['limit'] as int;
+          final current = old['effectiveLimit'] as int;
+          status = {...status, 'background': {..._background, 'parallelism': {
+            ...old, 'configuredLimit': limit, 'effectiveLimit': current > limit ? limit : current,
+          }}};
+        }
+        return capacityResult;
+      case 'retryBackgroundGateCleanup':
+        return onRetryGateCleanup?.call(args) ?? results[call.method] ?? {'ok': false};
       case 'setBackgroundMode':
         final r = results[call.method] ?? {'ok': true};
         if (r['ok'] == true) {
+          final mode = args['mode'];
           status = {
             ...status,
-            'background': {..._background, 'mode': args['mode']},
+            'background': {
+              ..._background,
+              'mode': mode,
+              if (_background['privileged'] case final Map privileged)
+                'privileged': {...privileged, 'mode': mode, 'ready': mode != 'off', 'reason': null},
+            },
           };
         }
         return r;
       case 'requestShizukuPermission':
         return true;
-      case 'adbStartPairing' || 'adbPair' || 'adbConnect':
+      case 'adbStartPairing' || 'adbPair' || 'adbConnect' || 'prepareRoot':
         return results[call.method] ?? {'ok': true};
       case 'grantSecureSettings':
         final result = results[call.method] ?? {'ok': true};
@@ -211,8 +318,9 @@ class FakePhoneNative {
         }
         return result;
       case 'getPolicies':
-        return policies;
+        return onGetPolicies != null ? onGetPolicies!() : policies;
       case 'setPolicies':
+        if (onSetPolicies != null) return onSetPolicies!(args);
         // As natively: what isn't sent stays, inside `unlocks` too.
         if (accept) {
           final unlocks = args['unlocks'];

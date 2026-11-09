@@ -4,6 +4,7 @@
 // Goldens: `flutter test --update-goldens test/chat/composer_mention_picker_test.dart`.
 
 import 'package:dsh_app/state/chat_state.dart';
+import 'package:dsh_app/state/settings_state.dart';
 import 'package:dsh_app/state/mention_state.dart';
 import 'package:dsh_app/state/voice_state.dart';
 import 'package:dsh_app/ui/chat/chat_screen.dart';
@@ -32,7 +33,7 @@ class _Sessions extends FakeSessions {
 
 /// The chat harness with conversations on this phone.
 class _Harness extends ChatHarness {
-  _Harness(this._sessions, {super.session, super.states});
+  _Harness(this._sessions, {super.session, super.states, super.settings});
   final _Sessions _sessions;
 
   @override
@@ -40,8 +41,13 @@ class _Harness extends ChatHarness {
 }
 
 class _Setup {
-  _Setup({String? session = 'main', List<SessionSummary> local = const []})
-    : harness = _Harness(_Sessions(local), session: session, states: {?session: const ChatState(loading: false)}),
+  _Setup({String? session = 'main', List<SessionSummary> local = const [], bool enterSends = false})
+    : harness = _Harness(
+        _Sessions(local),
+        session: session,
+        states: {?session: const ChatState(loading: false)},
+        settings: AppSettings(loaded: true, apiKey: testKey, hardwareEnterSends: enterSends),
+      ),
       carrier = referenceHost(now: DateTime.now());
 
   final ChatHarness harness;
@@ -50,7 +56,7 @@ class _Setup {
 
   late final client = DshClient.withCarrier(carrier);
 
-  Future<void> pump(WidgetTester tester, {Brightness brightness = Brightness.light}) async {
+  Future<void> pump(WidgetTester tester, {Brightness brightness = Brightness.light, bool enterSends = false}) async {
     usePhoneView(tester);
     mockClipboard(tester);
     await tester.pumpWidget(
@@ -140,6 +146,23 @@ void main() {
     expect(setup.harness.controllers['main']!.sent, ['看看 @lib/main.dart 为什么报错']);
   });
 
+  testWidgets('sending a changed query without current results preserves literal sending', (tester) async {
+    final setup = _Setup();
+    await setup.pump(tester);
+    await _type(tester, '@mai');
+    expect(find.text('main.dart'), findsOneWidget);
+
+    // Before the new lookup's debounce: the previous row has no authority
+    // over this query. As on a first lookup, Send can send the literal text.
+    await tester.enterText(find.byType(TextField), '@missing');
+    await tester.pump();
+    await tester.tap(find.byIcon(AppIcons.send));
+    await pumpFrames(tester, 2);
+    expect(setup.harness.controllers['main']!.sent, ['@missing']);
+    expect(_draft(tester).text, isEmpty);
+    expect(setup.recents.entries, isEmpty);
+  });
+
   testWidgets('a conversation goes in as its canonical mention', (tester) async {
     final setup = _Setup();
     await setup.pump(tester);
@@ -174,8 +197,8 @@ void main() {
     expect(find.byType(MentionChip), findsOneWidget);
   });
 
-  testWidgets('hardware keys: ↓ ↑ move, Enter picks, Esc closes', (tester) async {
-    final setup = _Setup();
+  testWidgets('hardware keys: Enter picks before opt-in Enter-to-send, Esc closes', (tester) async {
+    final setup = _Setup(enterSends: true);
     await setup.pump(tester);
     await tester.tap(find.byType(TextField));
     await _type(tester, '@d');

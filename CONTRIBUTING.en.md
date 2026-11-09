@@ -2,7 +2,19 @@
 
 [中文](CONTRIBUTING.md) · [Project overview](README.en.md)
 
-Contributions can fix bugs, improve documentation and translations, add tests, or extend plugins. Look for a related issue first. For larger changes to protocols, data formats or permissions, explain the problem and proposed approach before implementation so work can be coordinated.
+## No external pull requests for now
+
+This repository currently **does not accept any external pull requests** (code, docs, configuration or templates).
+
+- External PRs are closed automatically by the intake check, see `.github/workflows/pr-gate.yml`.
+- For feature ideas, improvements or bug reports, please [open an issue](https://github.com/ccch1mneyyy/dsh-Go/issues/new/choose) with the use case and expected behavior.
+- Internal PRs by the maintainer (and maintainer agents) are unaffected.
+
+This is temporary; this page will be updated when external PRs reopen.
+
+## Welcome
+
+Contributions through issues are welcome — bug reports, documentation and translation improvements, tests, or plugin work. For larger changes to protocols, data formats or permissions, explain the problem and proposed approach before implementation so work can be coordinated.
 
 ## Report an issue
 
@@ -32,11 +44,15 @@ Use one PR for one independently reviewable problem. Explain the old behavior, i
 
 Run these commands from the repository root. Select checks relevant to your change and record the commands and actual results in the PR. If a device, asset or dependency is unavailable, say what was not run and why.
 
+[CI](.github/workflows/ci.yml) runs these checks on PRs and `main`: a PR runs the general checks plus what it touches, a push to `main` runs everything, and `CI OK` is the result to read. CI has no devices or real accounts, so verify those separately.
+
 **Flutter app:**
 
 ```bash
 (cd app && flutter pub get && flutter analyze && flutter test)
 ```
+
+**UI work on a phone (hot reload):** `tooling/dev-run.sh` installs the debug build over the release build already on the phone, then attaches Flutter, so pressing `r` applies a change within seconds. It uses `adb install -r` and `flutter attach` instead of `flutter run`, because a failed `flutter run` install uninstalls the app first, which erases the phone's data. Animations stutter in debug mode, so use it for layout, sizes and colours, and judge smoothness on a release build. It needs `app/android/key.properties` with the same key as the build on the phone.
 
 **Dart communication packages:**
 

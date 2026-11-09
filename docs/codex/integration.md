@@ -1,5 +1,8 @@
 # Codex SSH backend
 
+Current preview baseline: DSH Go **1.0.14**. See the
+[upgrade manifest](upgrade-1.0.14.md) for compatibility decisions and validation.
+
 Select Codex when adding an SSH host. The existing chat UI, session drawer,
 Markdown renderer, attachment picker, file preview, search page and usage sheet
 are reused. DSH connections retain their existing behavior.
@@ -38,8 +41,9 @@ Queueing, branching/regeneration, voice, remote directory browsing and Office
 server conversion are not implemented. Codex retains a live subscription in the
 background because it does not support DSH's quiet-watch option.
 
-Original picker limits remain: images 20 MiB, files 30 MiB, nine attachments per
-message. Gallery/camera processing follows the existing picker; file selections
+Codex limits remain: images 20 MiB, files 30 MiB, nine attachments per
+message. The picker applies the Codex file cap before retaining oversized files;
+DSH connections retain upstream's 200 MiB file limit. Gallery/camera processing follows the existing picker; file selections
 preserve their bytes. Downloads use bounded windows and the existing 300 MiB cap;
 image previews have smaller limits. UTF-8 text preview is limited to 2 MiB;
 larger text can be downloaded and opened externally.
@@ -54,7 +58,7 @@ server. Unknown send outcomes are not automatically retransmitted.
 Unofficial Codex previews use the separate `.codexpreview` Android package and
 the ARM64 flavor. Set `ORG_GRADLE_PROJECT_codexPreview=true` and
 `DSH_BETA_TOKEN_FILE=` when using `tooling/build-apk.sh`. Pass
-`--build-name 1.0.2-codex-preview.1` before `--`, and
+`--build-name 1.0.14-codex-preview.1` before `--`, and
 `--dart-define=DSH_UPDATE_REPO=OWNER/REPOSITORY` after it to select the fork's
 release source without changing the upstream default. Generate release assets
 with `tooling/release_assets.py --repo OWNER/REPOSITORY --version VERSION
@@ -68,7 +72,13 @@ both older and newer Android API ranges before distribution.
 
 ## Validation results
 
-The development implementation passed 182 relevant App tests, 25 backend tests
+The 1.0.14 upgrade passed 416 focused App tests, 27 Codex backend tests,
+12 Codex client tests, 816 DSH client tests and 27 build-tool tests, with static
+analysis and l10n/guide checks. The DSH client suite skipped 31 tests requiring
+explicit live/disposable hosts. Device installation, real SSH reconnect and
+media playback remain unverified for this build.
+
+Historical validation of the original development implementation passed 182 relevant App tests, 25 backend tests
 and 12 client tests, plus static analysis. Live SSH/SFTP and Codex checks covered
 upload/download byte equality, model file reading, image history, token usage,
 quota and search. These results do not replace device validation after changes.

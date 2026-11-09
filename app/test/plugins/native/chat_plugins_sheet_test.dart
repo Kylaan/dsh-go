@@ -13,6 +13,7 @@ import 'dart:io';
 
 import 'package:dsh_app/plugins/seams/seams.dart';
 import 'package:dsh_app/state/hosts_state.dart';
+import 'package:dsh_app/ui/common/list_page_row.dart';
 import 'package:dsh_app/ui/plugins/islands/islands.dart';
 import 'package:dsh_app/ui/plugins/native/chat_plugins_sheet.dart';
 import 'package:dsh_app/ui/plugins/native/composer_capsules.dart';
@@ -20,6 +21,7 @@ import 'package:dsh_app/ui/plugins/native/native_composer_bar.dart';
 import 'package:dsh_app/ui/plugins/seats/seat_links.dart' show seatWebOpenerProvider;
 import 'package:dsh_app/ui/plugins/view/plugin_view.dart';
 import 'package:dsh_app/ui/web/web_target.dart';
+import 'package:dsh_app/ui_config/ui_config.dart';
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -243,6 +245,38 @@ void main() {
   });
 
   group('entry', () {
+    for (final nativePanels in [false, true]) {
+      testWidgets('hide.pluginCapsule hides only the built-in entry and can be restored: native=$nativePanels', (
+        tester,
+      ) async {
+        usePhoneView(tester);
+        var hidden = false;
+        await tester.pumpWidget(
+          _bar([
+            ..._overrides(_bridge(panels: nativePanels, capsules: 1), web: _web),
+            uiHiddenProvider(UiHideItem.pluginCapsule).overrideWith((ref) => hidden),
+          ]),
+        );
+        await pumpFrames(tester);
+        expect(_capsules(tester), ['按钮0', '插件']);
+        final c = ProviderScope.containerOf(tester.element(find.byType(NativeComposerBar)));
+        hidden = true;
+        c.invalidate(uiHiddenProvider(UiHideItem.pluginCapsule));
+        await pumpFrames(tester, 12);
+        expect(_capsules(tester), ['按钮0']);
+        expect(
+          c.read(chatPluginsHaveContentProvider('s1')),
+          isTrue,
+          reason: 'hiding an entry does not disable plugins',
+        );
+        expect(c.read(chatWebPluginsProvider('s1')).packages, isNotEmpty);
+        hidden = false;
+        c.invalidate(uiHiddenProvider(UiHideItem.pluginCapsule));
+        await pumpFrames(tester);
+        expect(_capsules(tester), ['按钮0', '插件']);
+      });
+    }
+
     testWidgets('the last capsule, outside the eight; not without content; away while a reply generates', (
       tester,
     ) async {
@@ -279,6 +313,45 @@ void main() {
     });
   });
 
+  group('the side panel\'s pane', () {
+    Finder otherPages() => find.widgetWithText(ListPageRow, '插件');
+
+    Future<void> pane(WidgetTester tester, Map<String, List<SlotOccupant>> web) async {
+      usePhoneView(tester);
+      await tester.pumpWidget(
+        testApp(
+          Scaffold(
+            body: ChatWebPluginsPane(sessionId: 's1', onOtherPages: () {}),
+          ),
+          overrides: _overrides(_bridge(panels: false), web: web),
+        ),
+      );
+      await pumpFrames(tester);
+    }
+
+    testWidgets('no pages, no way on', (tester) async {
+      await pane(tester, _web);
+      expect(otherPages(), findsNothing);
+    });
+
+    testWidgets('global pages have a way on, even of a plugin with parts here', (tester) async {
+      await pane(tester, {
+        ..._web,
+        Slots.main: [seats.occupant(Slots.main, seats.probe, 'k4-panel')],
+      });
+      expect(otherPages(), findsOneWidget);
+    });
+
+    testWidgets('a conversation page of a plugin with parts is its own row, not the way on', (tester) async {
+      await pane(tester, {
+        ..._web,
+        Slots.rightPaneTab: [seats.occupant(Slots.rightPaneTab, seats.probe, 'k4-tab')],
+      });
+      expect(find.byKey(ValueKey('chat-plugins-page|${seats.probe}|k4-tab')), findsOneWidget);
+      expect(otherPages(), findsNothing);
+    });
+  });
+
   group('sheet', () {
     testWidgets('native panels first, then whose the web parts are, then their island; 20 on both sides', (
       tester,
@@ -302,6 +375,10 @@ void main() {
       final spec = tester.widget<seats.FakeIsland>(find.byType(seats.FakeIsland)).spec;
       expect(spec.slot, Slots.chatSheet);
       expect(find.textContaining('网页插件'), findsOneWidget);
+      // The ways in sit under the island, DSH Web always last: a part that
+      // opens something the island never shows still has a way in.
+      expect(find.byKey(const ValueKey('chat-plugins-ways-in')), findsOneWidget);
+      expect(find.byKey(const ValueKey('chat-plugins-web-link')), findsOneWidget);
     });
 
     testWidgets('an island that can\'t come up is one 在网页版打开 row into the conversation', (tester) async {

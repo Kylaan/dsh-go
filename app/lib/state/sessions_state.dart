@@ -1,11 +1,13 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter/widgets.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../companion/companion_state.dart';
 import '../runtime/runtime_state.dart';
 import 'connection_state.dart';
 import 'hosts_state.dart';
@@ -103,6 +105,8 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
   Timer? _debounce;
   final _archives = <PendingSessionArchive>{};
   final _archiveLeases = <PendingSessionArchive>{};
+  final _deleting = <String>{};
+  final _deleted = <String>{};
   static const archiveUndoWindow = Duration(seconds: 4);
 
   void _retireArchives() {
@@ -128,6 +132,7 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
 
   /// Bumped by every build and refresh: only the newest load may land.
   int _loadSeq = 0;
+  int _appliedRefreshSeq = 0;
   List<SessionSummary> _all = const [];
   Set<String> _archived = const {};
   ReadListOrigin? _origin;
@@ -186,6 +191,11 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
       }
     });
     ref.onDispose(_retireArchives);
+    // Which conversation is the companion's is read from preferences after
+    // launch: hide it from the drawer as soon as that's known.
+    ref.listen(companionSessionFilterProvider, (_, _) {
+      if (state.hasValue && !state.isLoading) state = AsyncData(_visible());
+    });
     final seq = ++_loadSeq;
     final host = ref.watch(activeHostProvider);
     if (host != _host) {
@@ -193,6 +203,8 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
       // shows them as the reload's previous value until the new list lands.)
       _host = host;
       _all = const [];
+      _deleted.clear();
+      _deleting.clear();
       _archived = const {};
       _origin = null;
       _titles.clear();
@@ -228,11 +240,16 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
         if (_applyInPlace(event)) return;
         // Ready alone changes no conversation: it doesn't read the list a
         // second time behind the one a (re)connection is reading.
+        final readyAt = event is HostReadyEvent ? _loadSeq : null;
         _debouncedChange |= event is! HostReadyEvent;
         _debounce?.cancel();
         _debounce = Timer(const Duration(milliseconds: 400), () {
           final change = _debouncedChange;
           _debouncedChange = false;
+          // Only a successful request started after this ready covers it.
+          // A pre-ready response, newer pending/failing read or later change
+          // still needs the existing recovery path.
+          if (!change && readyAt != null && _appliedRefreshSeq == _loadSeq && _appliedRefreshSeq > readyAt) return;
           unawaited(_refresh(afterBuild: change));
         });
       }
@@ -270,7 +287,9 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
     }
     if (!r.mounted) return const [];
     if (seq == _loadSeq) {
-      _all = sessions;
+      // A list already in flight when deletion completed may still contain
+      // the old row. Only a server-confirmed deletion adds this host's fence.
+      _all = sessions.where((s) => !_deleted.contains(s.sessionId)).toList();
       final cache = r.read(readListCacheProvider);
       cache.stamp(sessions, identity, client);
       _origin = cache.origin(sessions);
@@ -304,27 +323,35 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
       default:
         return false;
     }
+    if (_deleted.contains(row.sessionId)) return true;
     final at = _all.indexWhere((s) => s.sessionId == row.sessionId);
     _all = at < 0 ? [..._all, row] : (List.of(_all)..[at] = row);
     state = AsyncData(_visible());
     return true;
   }
 
-  List<SessionSummary> _visible() => ref
-      .read(readListCacheProvider)
-      .derive(
-        _rows()
-            .where(
-              (s) =>
-                  !s.blank &&
-                  !s.isSubagent &&
-                  !_archived.contains(s.sessionId) &&
-                  !_archives.any((pending) => pending.ids.contains(s.sessionId)),
-            )
-            .toList()
-          ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt)),
-        _origin,
-      );
+  List<SessionSummary> _visible() {
+    final pendingIds = {for (final pending in _archives) ...pending.ids};
+    // Her conversation lives in 伙伴小屋, not the drawer.
+    final companion = ref.read(companionSessionFilterProvider);
+    final host = ref.read(activeHostProvider);
+    return ref
+        .read(readListCacheProvider)
+        .derive(
+          _rows()
+              .where(
+                (s) =>
+                    !s.blank &&
+                    !s.isSubagent &&
+                    !_archived.contains(s.sessionId) &&
+                    !pendingIds.contains(s.sessionId) &&
+                    !companion(host, s.sessionId),
+              )
+              .toList()
+            ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt)),
+          _origin,
+        );
+  }
 
   /// The last `session/list`, with the titles read since ([_readTitles]).
   List<SessionSummary> _rows() => _titles.isEmpty ? _all : [for (final s in _all) _withTitle(s)];
@@ -531,6 +558,7 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
       if (r.mounted && seq == _loadSeq) {
         state = AsyncData(sessions);
         cache.finishRefresh(ReadListKind.sessions, activity);
+        _appliedRefreshSeq = seq;
       }
     } catch (error, stack) {
       // A failed background refresh keeps the list it had.
@@ -541,28 +569,77 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
     }
   }
 
+  /// A send right after connecting can beat the lists the fallback reads. Give
+  /// them a moment; a host that never answers still gets to start the chat.
+  Future<void> _listsForNewChat() async {
+    ProviderSubscription<WorkspacesState>? listening;
+    final registry = Completer<void>();
+    void check(WorkspacesState workspaces) {
+      if (workspaces.status != WorkspacesStatus.loading && !registry.isCompleted) registry.complete();
+    }
+
+    try {
+      check(ref.read(workspacesProvider));
+      if (!registry.isCompleted) listening = ref.listen(workspacesProvider, (_, next) => check(next));
+      await Future.wait([future, registry.future]).timeout(const Duration(seconds: 3));
+    } catch (_) {
+      // Too slow or failed: nothing to pick from, so the host picks.
+    } finally {
+      listening?.close();
+    }
+  }
+
   /// Creates a session in the workspace the drawer shows (else the default
-  /// directory) and returns its id.
-  Future<String> create() async {
+  /// directory) and returns its id. [autoApprove] false keeps the host's
+  /// permission preset even when 自动批准命令 is on (the companion's).
+  Future<String> create({bool autoApprove = true}) async {
     final conn = ref.read(activeConnectionProvider).value;
     if (conn == null) throw StateError('not connected');
-    // Remote hosts: only the working directory configured for that host, else
-    // the remote DSH's own default.
+    return createForConnection(conn, autoApprove: autoApprove, isCurrent: () => true);
+  }
+
+  /// Creates for a captured connection. The caller retires its intent through
+  /// [isCurrent]; waits and workspace fallback must not start a later write.
+  Future<String> createForConnection(
+    HostConnection conn, {
+    required bool Function() isCurrent,
+    bool autoApprove = true,
+  }) async {
+    final owner = ref;
+    void checkCurrent() {
+      if (!owner.mounted || !isCurrent()) throw const DshClosedException('session creation superseded');
+    }
+
+    checkCurrent();
+    // Remote hosts: the working directory configured for that host, else the
+    // workspace used last (as the official client does), else the remote DSH's
+    // own default.
+    var workspaceId = await workspaceForNewSession(ref);
+    checkCurrent();
+    if (workspaceId == null && _hostPicksNewChatDirectory(conn)) {
+      await _listsForNewChat();
+      checkCurrent();
+      final sameHost = identical(ref.read(activeConnectionProvider).value?.client, conn.client);
+      if (sameHost) workspaceId = _recentForNewChat(conn, ref.read(workspacesProvider), state.value)?.workspaceId;
+    }
     final created = await createSessionInWorkspace(
       conn.client,
-      await workspaceForNewSession(ref),
+      workspaceId,
       cwd: conn.isLocal ? localWorkspaceDir : conn.workingDirectory,
+      checkCurrent: checkCurrent,
     );
+    checkCurrent();
     // Safe mode keeps the default preset: the agent there repairs the engine
     // with a full shell already, and every command should still be asked.
     final safeMode = ref.read(localRuntimeProvider).status.inSafeMode;
-    if (conn.isLocal && !safeMode && ref.read(settingsProvider).autoApproveCommands) {
+    if (autoApprove && conn.isLocal && !safeMode && ref.read(settingsProvider).autoApproveCommands) {
       try {
         await conn.client.setPermissionPreset(created.sessionId, 'danger-full-access');
       } catch (_) {
         // Keep the default preset if the command is unavailable.
       }
     }
+    checkCurrent();
     unawaited(refresh());
     return created.sessionId;
   }
@@ -579,18 +656,27 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
     }
     final conn = ref.read(activeConnectionProvider).value;
     final host = ref.read(activeHostProvider);
-    final ids = sessionIds.toSet().toList();
+    final idsSet = sessionIds.toSet();
+    final ids = idsSet.toList();
     if (conn == null ||
         !identical(ref.read(readListLiveConnectionProvider), conn) ||
         ids.isEmpty ||
         state.isLoading ||
-        ids.any((id) => !_all.any((s) => s.sessionId == id && !s.blank && !s.isSubagent) || _archived.contains(id))) {
+        ids.any((id) => _archived.contains(id) || _deleting.contains(id))) {
+      throw const DshClosedException('session owner or inventory changed');
+    }
+    final remaining = Set<String>.of(idsSet);
+    for (final row in _all) {
+      if (!row.blank && !row.isSubagent) remaining.remove(row.sessionId);
+      if (remaining.isEmpty) break;
+    }
+    if (remaining.isNotEmpty) {
       throw const DshClosedException('session owner or inventory changed');
     }
     for (final existing in _archives) {
-      if (existing.ids.any(ids.contains)) {
+      if (existing.ids.any(idsSet.contains)) {
         if (existing._committing) throw StateError('archive already committing');
-        if (existing.ids.length == ids.length && existing.ids.every(ids.contains)) return existing;
+        if (existing.ids.length == ids.length && existing.ids.every(idsSet.contains)) return existing;
       }
     }
     final generation = conn.client.mux.generation;
@@ -719,7 +805,36 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
     return pending;
   }
 
+  /// Reserves a live row for a confirmed destructive request. The Host remains
+  /// authoritative about jobs, descendants and other writers.
+  String? beginDeletion(String sessionId) {
+    if (state.isLoading || !state.hasValue || _host != ref.read(activeHostProvider)) return 'inventory-changed';
+    final row = _all.where((s) => s.sessionId == sessionId && !s.blank && !s.isSubagent).firstOrNull;
+    if (row == null || _deleted.contains(sessionId)) return 'inventory-changed';
+    if (row.running) return 'session-active';
+    if (_archiveLeases.any((p) => p.ids.contains(sessionId))) return 'archive-pending';
+    if (!_deleting.add(sessionId)) return 'busy';
+    return null;
+  }
+
+  void endDeletion(String sessionId) => _deleting.remove(sessionId);
+
+  /// Called only for a matching successful Host response, never optimistically.
+  void confirmDeleted(String sessionId) {
+    _deleted.add(sessionId);
+    _deleting.remove(sessionId);
+    _all = _all.where((s) => s.sessionId != sessionId).toList();
+    _archived = {..._archived}..remove(sessionId);
+    _titles.remove(sessionId);
+    _titleFailures.remove(sessionId);
+    _titleReads?.queue.removeWhere((s) => s.sessionId == sessionId);
+    if (state.hasValue && !state.isLoading) state = AsyncData(_visible());
+  }
+
   Future<void> archive(String sessionId) async {
+    if (_deleting.contains(sessionId) || _deleted.contains(sessionId)) {
+      throw const DshClosedException('session is being deleted');
+    }
     final conn = ref.read(activeConnectionProvider).value;
     if (conn == null) throw const DshClosedException('not connected');
     await conn.client.archiveSession(sessionId, stopActivity: true);
@@ -743,6 +858,33 @@ class SessionsController extends AsyncNotifier<List<SessionSummary>> {
 
 final sessionsProvider = AsyncNotifierProvider<SessionsController, List<SessionSummary>>(SessionsController.new);
 
+/// A remote host with no working directory of its own: without a workspace, a
+/// new conversation would land wherever its `dsh web` happened to start.
+bool _hostPicksNewChatDirectory(HostConnection? conn) => conn != null && !conn.isLocal && conn.workingDirectory == null;
+
+Workspace? _recentForNewChat(HostConnection? conn, WorkspacesState registry, List<SessionSummary>? sessions) {
+  if (!_hostPicksNewChatDirectory(conn) || !registry.ready || sessions == null) return null;
+  return recentWorkspace(registry.workspaces, sessions);
+}
+
+/// Where a new conversation falls back to when the drawer selects no workspace;
+/// null while the lists load, on hosts with a directory of their own, or when
+/// the host has no workspace yet.
+final recentWorkspaceForNewChatProvider = Provider<Workspace?>((ref) {
+  final conn = ref.watch(activeConnectionProvider).value;
+  // Elsewhere the chat screen must not start the lists just to learn this.
+  if (!_hostPicksNewChatDirectory(conn)) return null;
+  return _recentForNewChat(conn, ref.watch(workspacesProvider), ref.watch(sessionsProvider).value);
+});
+
+/// Whether a new conversation will run in the host's own default directory,
+/// because the host has no workspace to fall back to.
+final newChatInHostDefaultProvider = Provider<bool>((ref) {
+  if (!_hostPicksNewChatDirectory(ref.watch(activeConnectionProvider).value)) return false;
+  final registry = ref.watch(workspacesProvider);
+  return registry.ready && registry.workspaces.isEmpty;
+});
+
 /// The title reads of one connection ([SessionsController._readTitles]).
 class _TitleReads {
   _TitleReads(this.client, this.ref, this.now);
@@ -764,9 +906,28 @@ class _TitleReads {
   bool retired = false;
 }
 
+/// Folder chosen for the unsent new-chat draft, scoped to the active host.
+/// This is a local drawer folder, not the engine's working directory.
+class PendingSessionFolderController extends Notifier<String?> {
+  @override
+  String? build() {
+    ref.watch(activeHostProvider);
+    return null;
+  }
+
+  void select(String? folderId) => state = folderId;
+}
+
+final pendingSessionFolderProvider = NotifierProvider<PendingSessionFolderController, String?>(
+  PendingSessionFolderController.new,
+);
+
 /// The session shown in the chat screen; null means "new chat".
 class CurrentSessionController extends Notifier<String?> {
   static const _key = 'last_session_id';
+  static const _selectionKey = 'last_session_selection';
+
+  static String _hostKey(HostRef host) => '${host.kind.name}:${host.id}';
 
   /// Every explicit choice counts, including selecting the already-null new chat.
   int _selectionRevision = 0;
@@ -784,10 +945,28 @@ class CurrentSessionController extends Notifier<String?> {
 
   /// Reopens the conversation that was open when the app was last closed.
   Future<void> _restore() async {
+    final owner = ref;
     try {
       final prefs = await SharedPreferences.getInstance();
-      final last = prefs.getString(_key);
-      if (last != null && state == null && !_touched) state = last;
+      if (!owner.mounted || _touched || state != null) return;
+      final raw = prefs.getString(_selectionKey);
+      final legacy = prefs.getString(_key);
+      if (raw == null && legacy == null) return;
+
+      await owner.read(activeHostProvider.notifier).ready;
+      if (!owner.mounted || _touched || state != null) return;
+      final host = owner.read(activeHostProvider);
+      if (raw != null) {
+        final saved = jsonDecode(raw);
+        if (saved is! Map || saved['host'] != _hostKey(host)) return;
+        final id = saved['sessionId'];
+        if (id is String) state = id;
+      } else {
+        // Old IDs have no host binding. Keep their existing compatibility
+        // only when startup actually chose the saved host; a skipped remote
+        // must not turn its unbound ID into a local conversation.
+        if (HostRef.decode(prefs.getString(ActiveHostController.prefsKey)) == host) state = legacy;
+      }
     } catch (_) {
       // No preferences backend (tests) or unreadable store: start with a new chat.
     }
@@ -796,12 +975,20 @@ class CurrentSessionController extends Notifier<String?> {
   void select(String? sessionId) {
     _selectionRevision++;
     _touched = true;
+    final host = ref.read(activeHostProvider);
+    ref.read(pendingSessionFolderProvider.notifier).select(null);
     state = sessionId;
-    unawaited(
-      SharedPreferences.getInstance()
-          .then((prefs) => sessionId == null ? prefs.remove(_key) : prefs.setString(_key, sessionId))
-          .catchError((_) => false),
-    );
+    unawaited(_persist(host, sessionId));
+  }
+
+  Future<void> _persist(HostRef host, String? sessionId) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      // One value owns both pieces, including an explicit new-chat choice.
+      // Its null ID also wins if removing a leftover legacy key fails.
+      await prefs.setString(_selectionKey, jsonEncode({'host': _hostKey(host), 'sessionId': sessionId}));
+      await prefs.remove(_key);
+    } catch (_) {}
   }
 }
 

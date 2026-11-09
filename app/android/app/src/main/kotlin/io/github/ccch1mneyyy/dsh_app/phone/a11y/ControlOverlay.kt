@@ -1,16 +1,14 @@
 // Portions derived from Phase (https://github.com/CikeSeven/phase), used with the author's permission. See THIRD_PARTY_NOTICES.md.
-// Local changes: a status pill at the top that folds into a side ball when left alone; separate
-// confirm and handoff cards; buttons that refuse injected or obscured touches; pass-through and
-// hide hooks for the Actuator and screenshots; blocking UserGate calls.
+// Local changes: a status control at the top in three forms (ball, capsule, card) on one morphing
+// surface; separate confirm and handoff cards; buttons that refuse injected or obscured touches;
+// pass-through and hide hooks for the Actuator and screenshots; blocking UserGate calls.
 
 package io.github.ccch1mneyyy.dsh_app.phone.a11y
 
 import io.github.ccch1mneyyy.dsh_app.i18n.AppStrings
 import io.github.ccch1mneyyy.dsh_app.R
+import io.github.ccch1mneyyy.dsh_app.phone.background.BackgroundPreview
 import android.accessibilityservice.AccessibilityService
-import android.animation.Animator
-import android.animation.AnimatorListenerAdapter
-import android.animation.ValueAnimator
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -28,14 +26,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.text.InputFilter
-import android.text.InputType
+import android.text.SpannableStringBuilder
+import android.text.Spanned
 import android.text.TextUtils
+import android.text.style.RelativeSizeSpan
+import android.text.style.StyleSpan
 import android.util.DisplayMetrics
 import android.util.Log
-import android.util.TypedValue
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.View
@@ -43,10 +41,7 @@ import android.view.WindowInsets
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityManager
 import android.view.accessibility.AccessibilityNodeInfo
-import android.view.animation.PathInterpolator
-import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -56,30 +51,34 @@ import io.github.ccch1mneyyy.dsh_app.phone.Decision
 import io.github.ccch1mneyyy.dsh_app.links.LinkTrampolineActivity
 import io.github.ccch1mneyyy.dsh_app.phone.HandoffCause
 import io.github.ccch1mneyyy.dsh_app.phone.HandoffResult
+import io.github.ccch1mneyyy.dsh_app.phone.PhoneControl
 import io.github.ccch1mneyyy.dsh_app.phone.PhoneRegistry
+import io.github.ccch1mneyyy.dsh_app.phone.PhoneUnlocks
 import io.github.ccch1mneyyy.dsh_app.phone.UserGate
 import io.github.ccch1mneyyy.dsh_app.phone.PhonePromptPresenter
 import io.github.ccch1mneyyy.dsh_app.phone.PhonePromptUi
 import io.github.ccch1mneyyy.dsh_app.phone.PromptPresentation
 import io.github.ccch1mneyyy.dsh_app.phone.MainThreadCall
 import io.github.ccch1mneyyy.dsh_app.pet.SafeArea
-import io.github.ccch1mneyyy.dsh_app.pet.Side
 import io.github.ccch1mneyyy.dsh_app.pet.WindowPos
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import kotlin.math.roundToInt
 
 /**
  * The main-screen [UserGate]: TYPE_ACCESSIBILITY_OVERLAY windows owned by the service
  * (no SYSTEM_ALERT_WINDOW). Blocking calls come from the bridge worker; all views live on
  * the main thread.
+ *
+ * While a task runs the person sees one control at the top, in three forms
+ * (docs/design/phone-overlay.md): the capsule with the line and 暂停 / 停止 ([OverlayCapsule]),
+ * the card it grows into, and the ball it folds into ([OverlayBall]). [FoldClock] decides the
+ * form; this class plays the morphs between them and keeps 停止 one step away in every form.
  */
 internal class ControlOverlay(private val service: AccessibilityService) : UserGate, PhonePromptPresenter {
     private val main = Handler(Looper.getMainLooper())
     private val wm = service.getSystemService(WindowManager::class.java)
     private val a11y = service.getSystemService(AccessibilityManager::class.java)
     private val ime = service.getSystemService(InputMethodManager::class.java)
-    private val easing = PathInterpolator(0.2f, 0f, 0f, 1f)
 
     /** 暂停 is on: the driver refuses actions until 继续. */
     @Volatile var paused = false
@@ -92,6 +91,15 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     /** Debug probe only: draw in the dark (true) or light (false) palette whatever the system says. */
     @Volatile var debugDark: Boolean? = null
 
+    /** Debug probe only: show these lifted limits instead of the person's. */
+    @Volatile var debugUnlocks: PhoneUnlocks? = null
+
+    /** Debug probe only: the task's app, as the core would have set it. */
+    @Volatile var debugApp: String? = null
+
+    /** Debug probe only: no timer changes the form (screenshots of the card). */
+    @Volatile var debugFreeze = false
+
     /** Debug probe only: let an injected tap reach a guarded button to observe the other checks. */
     @Volatile var debugIgnoreInjectGuard = false
 
@@ -101,35 +109,47 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
 
     // ---- main-thread state ----
     private var statusText: String? = null
+    private val statusOwnership = StatusOwnership()
+    private var line: StatusLine? = null
+    private val steps = StepHistory()
     private var stoppedNote = false
-    private var pill: Pill? = null
+
+    /** 「已发给 DSH：…」 for a moment after 插话, in the line's place. */
+    private var steerNote: String? = null
+    private var pill: OverlayCapsule? = null
+    private val previewOwner = Any()
+    private var previewTaskId: Long? = null
+    private var previewPill: OverlayCapsule? = null
+    @Volatile private var destroying = false
+    private val previewDecoder = OverlayPreviewDecoder { bitmap ->
+        val target = previewPill
+        if (target == null || destroying) bitmap?.recycle()
+        else target.showPreview(bitmap, s(if (bitmap == null) R.string.overlay_preview_unavailable else R.string.overlay_preview_readonly))
+    }
     private var confirmCard: Card? = null
     private var handoffCard: Card? = null
     private var pendingConfirm: Pending<Decision>? = null
     private var pendingHandoff: Pending<HandoffResult>? = null
     @Volatile private var sharedPrompt: PromptPresentation? = null
     private var passThrough = false
-    private var captureHidden = false
+    private val captureVisibility = CaptureVisibility()
+    private val captureHidden: Boolean get() = captureVisibility.hidden
     private var darkBuilt: Boolean? = null
 
-    // Folding: the pill gives way to the ball after a while without a touch (FoldClock).
+    // The form: FoldClock decides, the morphs follow.
     private val fold = FoldClock()
     private var ball: OverlayBall? = null
 
-    /** What is on screen: the pill, or the ball (lags [fold] while a fold or unfold plays). */
+    /** What is on screen: the capsule (or card), or the ball (lags [fold] while a fold or unfold plays). */
     private var ballShown = false
-
-    /** The card's shrink or grow while it plays (the ball's glides are its own). */
-    private var morph: Animator? = null
     private val foldTick = Runnable { onFoldTick() }
 
-    // 闲置时不透明度 and 「闲置时自动收起」 (设置 → 手机操控 → 悬浮条), live while showing.
+    /** A narrower line may shrink the capsule now. */
+    private val shrinkTick = Runnable { renderPill() }
+
+    // 闲置时不透明度 (the ball's) and 「闲置时自动收起」 (设置 → 手机操控 → 悬浮条), live while showing.
     private val overlayPrefs = OverlayPrefs.prefs(service)
     private var idleOpacity = OverlayPrefs.from(overlayPrefs).idleOpacity
-
-    /** The surface opacity on screen now (pill and ball alike), and its fade. */
-    private var surfaceAlpha = 1f
-    private var dimAnim: ValueAnimator? = null
     private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == OverlayPrefs.K_OPACITY || key == OverlayPrefs.K_AUTO_FOLD) main.post { onPrefsChanged() }
     }
@@ -155,24 +175,51 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
 
     private class Card(val root: FrameLayout, val params: WindowManager.LayoutParams, val tick: Runnable?)
 
-    private class Pill(
-        val root: FrameLayout, val params: WindowManager.LayoutParams, val card: LinearLayout, val row: LinearLayout,
-        val text: TextView, val dot: View, val pause: TextView, val stop: TextView, val collapse: View,
-        val inputRow: LinearLayout, val input: EditText, var pulse: ValueAnimator?,
-        /** 「已解除限制」: shown while any hard rule is lifted; opens that page in the app. */
-        val unlocked: TextView,
-    )
-
     // ---- UserGate --------------------------------------------------------------------------------
 
-    override fun status(text: String?) {
+    override fun status(text: String?) = status(text) { update -> update(); true }
+
+    override fun status(text: String?, ifCurrent: (() -> Unit) -> Boolean) {
         main.post {
+            // This runnable and close apply on the same queue. Never hold the task lock
+            // over WindowManager work or enqueue a second, unguarded status runnable.
+            // The pill's 暂停 / 停止 / 插话 are bound to this status's own task, captured inside its guard.
+            if (!statusOwnership.publish(ifCurrent) { PhoneRegistry.controlListener?.shownControls() }) return@post
+            if (editing && statusOwnership.editingControls == null) endEditing()
             statusText = text
+            paused = statusOwnership.controls?.isPaused() == true
             setStopped(false)
             if (text == null) {
+                statusOwnership.clear()
                 paused = false
-                removePill(animated = true)
-            } else showPill()
+                line = null
+                steps.clear()
+                removePill(animated = true, preservePrompts = true)
+            } else {
+                val l = StatusLines(AppStrings.get(service, R.string.phone_waived_status), AppStrings.get(service, R.string.phone_acting)).parse(text)
+                line = l
+                steps.add(l)
+                showPill()
+            }
+        }
+    }
+
+    override fun clearStatus(ifCurrent: (() -> Unit) -> Unit) {
+        main.post {
+            // The displayed status can be stale even if this cleanup request lost selection.
+            // Prompt cards and their CONFIRM/HANDOFF holds belong to separate tickets.
+            val stale = statusOwnership.takeStale()
+            var accepted = false
+            ifCurrent { accepted = true }
+            if (stale || accepted) {
+                statusOwnership.clear()
+                statusText = null
+                line = null
+                steps.clear()
+                setStopped(false)
+                paused = false
+                removePill(animated = true, preservePrompts = true)
+            }
         }
     }
 
@@ -182,7 +229,18 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         val confirm = pendingConfirm
         val handoff = pendingHandoff
         main.post {
-            ifCurrent {
+            // A -> stop -> B can invalidate A's cleanup ticket while A's status is
+            // still displayed. Retire that status by its own owner, without touching B's cards.
+            if (statusOwnership.takeStale()) {
+                statusText = null
+                line = null
+                steps.clear()
+                setStopped(false)
+                removePill(animated = false, preservePrompts = true)
+            }
+            var cleanupCurrent = false
+            ifCurrent { cleanupCurrent = true }
+            if (cleanupCurrent) {
                 // A new pre-tool engine prompt can share an inactive task id. Remove only the
                 // questions captured by this cleanup, even when the task itself has not started.
                 if (sharedPrompt === shared) {
@@ -197,7 +255,10 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
                     handoff?.resolve(HandoffResult.STOP)
                     dismissHandoff()
                 }
+                statusOwnership.clear()
                 statusText = null
+                line = null
+                steps.clear()
                 setStopped(false)
                 paused = false
                 removePill(animated = true)
@@ -256,23 +317,69 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
 
     /** Makes every overlay window untouchable (true) so an injected stroke reaches the app below. */
     fun setPassThrough(on: Boolean) {
+        // Cleanup must survive a busy main thread or an interrupted gesture worker.
+        // Gesture calls are serialized; this stays ahead of the next queued enable.
+        if (!on) { main.post { applyPassThrough(false) }; return }
         if (Looper.myLooper() == Looper.getMainLooper()) { applyPassThrough(on); return }
         val changed = onMain(500) { applyPassThrough(on) } == true
-        if (on && changed) SystemClock.sleep(80) // input windows update a frame after the layout
+        if (changed) SystemClock.sleep(80) // input windows update a frame after the layout
     }
 
-    /** Hides the overlay for a full-display screenshot (API 30–33). */
-    fun hideForCapture(hide: Boolean) {
-        val changed = onMain(500) {
-            if (captureHidden == hide) return@onMain false
-            captureHidden = hide
-            val v = if (hide) View.INVISIBLE else View.VISIBLE
+    /** Paired hides for full-display screenshots; captures may overlap. */
+    fun hideForCapture(hide: Boolean) { captureHiddenResult(hide, false) }
+
+    /** Null means the UI hide did not finish normally. An empty set is a normal result.
+     * The IDs describe only this operation's invisible attached controls, not compositor pixels.
+     * The caller must still pair this with hideForCapture(false), including on interruption. */
+    internal fun hideForCaptureWithReceipt(): Set<Int>? = captureHiddenResult(true, true)
+
+    private fun captureHiddenResult(hide: Boolean, includeWindowIds: Boolean): Set<Int>? {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            // The main-thread pet caller schedules its own delay before it shoots.
+            applyCaptureHidden(hide)
+            return if (includeWindowIds) hiddenWindowIds() else null
+        }
+        // Both halves run on the main queue in the order they were asked for and are never
+        // cancelled: a release can't overtake its own hide, and recovery still runs if the
+        // screenshot worker times out or is interrupted.
+        val applied = CountDownLatch(1)
+        var settle = false
+        var windowIds: Set<Int>? = null
+        main.post {
+            try {
+                settle = applyCaptureHidden(hide)
+                if (includeWindowIds) windowIds = hiddenWindowIds()
+            } catch (e: Exception) { Log.w(TAG, "overlay main-thread call failed", e) }
+            finally { applied.countDown() }
+        }
+        if (!hide || !applied.await(500, TimeUnit.MILLISECONDS)) return null
+        if (settle) SystemClock.sleep(120)
+        return windowIds
+    }
+
+    @Suppress("DEPRECATION")
+    private fun hiddenWindowIds(): Set<Int> = buildSet {
+        for ((root, _) in windows()) {
+            val id = runCatching {
+                if (!root.isAttachedToWindow || root.visibility == View.VISIBLE) null
+                else {
+                    val node = root.createAccessibilityNodeInfo()
+                    if (node == null) null
+                    else try { node.windowId.takeIf { it >= 0 } } finally { node.recycle() }
+                }
+            }.getOrNull()
+            if (id != null) add(id)
+        }
+    }
+
+    private fun applyCaptureHidden(hide: Boolean): Boolean {
+        if (captureVisibility.update(hide)) {
+            val v = if (captureHidden) View.INVISIBLE else View.VISIBLE
             syncWindows()
             confirmCard?.root?.visibility = v
             handoffCard?.root?.visibility = v
-            pill != null || confirmCard != null || handoffCard != null
-        } == true
-        if (hide && changed) SystemClock.sleep(120)
+        }
+        return hide && (pill != null || confirmCard != null || handoffCard != null)
     }
 
     /** Screen off, lock, 停止 elsewhere, service going away: answer everything pending with STOP. */
@@ -288,17 +395,18 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
             if (sharedPrompt == null && pendingConfirm === confirm) { confirm?.resolve(Decision.STOP); dismissConfirm() }
             if (pendingHandoff === handoff) { handoff?.resolve(HandoffResult.STOP); dismissHandoff() }
             paused = false
+            clearPreview()
             endEditing()
             if (statusText != null) { setStopped(true); renderPill(); clearStoppedLater() }
         }
     }
 
-    /** "已停止" stays briefly; if the core doesn't clear or replace the status, the pill (and its KEEP_SCREEN_ON) goes. */
+    /** "已停止" stays briefly; if the core doesn't clear or replace the status, the control (and its KEEP_SCREEN_ON) goes. */
     private fun clearStoppedLater() {
-        main.postDelayed({ if (stoppedNote) { statusText = null; setStopped(false); paused = false; removePill(animated = true) } }, 4_000)
+        main.postDelayed({ if (stoppedNote) { statusText = null; line = null; steps.clear(); setStopped(false); paused = false; removePill(animated = true) } }, 4_000)
     }
 
-    /** The 已停止 note: holds the pill (or the ball) as it is, so nothing folds on the way out. */
+    /** The 已停止 note: holds the capsule (or the ball) as it is, the card folding back first. */
     private fun setStopped(on: Boolean) {
         stoppedNote = on
         if (on) holdFold(FoldClock.Hold.STOPPED) else releaseFold(FoldClock.Hold.STOPPED)
@@ -307,17 +415,46 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     /** Debug probe: screen centre of the visible button labelled [label], if any. */
     fun debugButtonCenter(label: String): Pair<Int, Int>? = onMain(1_000) {
         fun find(v: View): View? {
-            if (v is TextView && v.text?.toString() == label) return v
+            if ((v is TextView && v.text?.toString() == label) || v.contentDescription?.toString() == label) return v
             if (v is android.view.ViewGroup) for (i in 0 until v.childCount) find(v.getChildAt(i))?.let { return it }
             return null
         }
-        val roots = listOfNotNull(confirmCard?.root, handoffCard?.root, pill?.root?.takeIf { it.isShown })
+        val roots = listOfNotNull(confirmCard?.root, handoffCard?.root, pill?.root?.takeIf { it.isShown }, ball?.root?.takeIf { it.isShown })
         roots.firstNotNullOfOrNull { find(it) }?.let { v ->
             val loc = IntArray(2)
             v.getLocationOnScreen(loc)
             (loc[0] + v.width / 2) to (loc[1] + v.height / 2)
         }
     }
+
+    /** Debug probe: puts the control in [form] (ball, capsule, card) as the person's taps would. */
+    fun debugForm(form: String) {
+        main.post {
+            when (form) {
+                "ball" -> if (!fold.folded) collapseByHand()
+                "capsule" -> if (fold.folded) onBallTapped() else if (fold.expanded) onLineTapped()
+                "card" -> if (fold.folded) { onBallTapped(); main.postDelayed({ onLineTapped() }, 700) } else if (!fold.expanded) onLineTapped()
+            }
+        }
+    }
+
+    /** Debug probe: 暂停 / 继续 / 停止 / the steer field, as the keys do. */
+    fun debugKey(key: String) {
+        main.post {
+            when (key) {
+                "pause" -> togglePause()
+                "stop" -> stopFromPill()
+                "steer" -> startSteer()
+                "done" -> endEditing()
+            }
+        }
+    }
+
+    /** Debug probe: what the control is showing. */
+    fun debugState(): String = onMain(1_000) {
+        "form=${fold.form} ballShown=$ballShown shape=${pill?.shape} paused=$paused stopped=$stoppedNote line=${line?.text} " +
+            "window=${pill?.params?.let { "${it.width}x${it.height}@${it.y}" }} ball=${ball?.let { "${it.pos}" }} steps=${steps.before(line, 3)}"
+    } ?: "timeout"
 
     fun onConfigurationChanged() {
         main.post {
@@ -327,8 +464,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
                 pill?.let { removePill(animated = false); if (statusText != null) showPill() }
             } else {
                 pill?.let { p ->
-                    cancelMorph()
-                    place(p.root, p.params, top = true)
+                    placeCapsule(p)
                     ball?.let { b -> if (ballShown) b.move(b.dockPos()) }
                 }
                 confirmCard?.let { place(it.root, it.params, top = false) }
@@ -338,18 +474,67 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     }
 
     fun destroy() {
+        destroying = true
         sharedPrompt?.ticket?.stop()
         pendingConfirm?.resolve(Decision.STOP)
         pendingHandoff?.resolve(HandoffResult.STOP)
         overlayPrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
         main.post {
+            clearPreview()
             dismissConfirm()
             dismissHandoff()
             removePill(animated = false)
         }
     }
 
-    // ---- pill -----------------------------------------------------------------------------------
+    /** Subscription visibility follows the existing card, never the mere existence of its View. */
+    private fun syncPreview() {
+        val p = pill
+        val control = PhoneControl.peek()
+        val taskId = if (!destroying && p != null && p.root.isAttachedToWindow && fold.expanded &&
+            !ballShown && !captureHidden && !stoppedNote && !waiting() &&
+            confirmCard == null && handoffCard == null && pendingHandoff == null)
+            control?.liveTask()?.id else null
+        if (taskId == previewTaskId && (taskId == null || previewPill === p)) return
+        clearPreview()
+        if (taskId == null || p == null || control == null) return
+        previewTaskId = taskId
+        previewPill = p
+        control.preview.addConsumer(previewOwner, taskId, BackgroundPreview.ConsumerKind.OVERLAY) { frame ->
+            if (destroying || previewTaskId != taskId || previewPill !== p) return@addConsumer
+            when (frame["state"]) {
+                "frame" -> (frame["imageBytes"] as? ByteArray)?.let(previewDecoder::offer)
+                else -> {
+                    previewDecoder.clear()
+                    val label = when (frame["state"]) {
+                        "off" -> null
+                        "inUse" -> s(R.string.overlay_preview_in_use)
+                        "protected" -> s(R.string.overlay_preview_protected)
+                        "waiting" -> s(R.string.overlay_preview_waiting)
+                        else -> s(R.string.overlay_preview_unavailable)
+                    }
+                    p.showPreview(null, label)
+                }
+            }
+        }
+    }
+
+    private fun clearPreview() {
+        PhoneControl.peek()?.preview?.removeConsumer(previewOwner)
+        previewDecoder.clear()
+        previewPill?.showPreview(null, null)
+        previewPill = null
+        previewTaskId = null
+    }
+
+    // ---- capsule ----------------------------------------------------------------------------------
+
+    private fun s(id: Int, vararg args: Any): String = AppStrings.get(service, id, *args)
+
+    private fun unlocks(): PhoneUnlocks = debugUnlocks ?: PhoneRegistry.unlocks()
+
+    /** A confirm (or a shared prompt) is up: the line points at it. */
+    private fun waiting() = pendingConfirm != null || sharedPrompt != null
 
     private fun showPill() {
         if (pill == null) {
@@ -358,71 +543,101 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
             if (!add(p.root, p.params)) return
             pill = p
             ballShown = false
-            dimAnim?.cancel()
-            surfaceAlpha = 1f
             fold.start(now())
             syncWindows()
+            renderPill(animated = false)
             enter(p.root)
             scheduleFold()
+            return
         }
         renderPill()
     }
 
-    private fun renderPill() {
+    /** What the capsule, the card and the ball say now; [animated] cross-fades what changed. */
+    private fun renderPill(animated: Boolean = true) {
         val p = pill ?: return
-        val base = statusText ?: return
-        p.text.text = when {
-            stoppedNote -> AppStrings.get(service, R.string.overlay_stopped)
-            paused -> AppStrings.get(service, R.string.overlay_paused)
-            else -> base
+        val base = line ?: return
+        val u = unlocks()
+        val look = when {
+            stoppedNote -> MarkLook.STOPPED
+            waiting() -> MarkLook.WAITING
+            paused -> MarkLook.PAUSED
+            else -> MarkLook.RUNNING
         }
-        p.pause.text = if (paused) AppStrings.get(service, R.string.overlay_continue) else AppStrings.get(service, R.string.overlay_pause)
-        p.pause.contentDescription = if (paused) AppStrings.get(service, R.string.overlay_resume_description) else AppStrings.get(service, R.string.overlay_pause_description)
-        p.pause.visibility = if (stoppedNote) View.GONE else View.VISIBLE
-        p.stop.visibility = if (stoppedNote) View.GONE else View.VISIBLE
-        p.collapse.visibility = if (stoppedNote) View.GONE else View.VISIBLE
-        p.unlocked.visibility = if (!stoppedNote && PhoneRegistry.unlocks().any) View.VISIBLE else View.GONE
-        val animate = !paused && !stoppedNote && !ballShown && animationsOn()
-        if (animate && p.pulse == null) {
-            p.pulse = ValueAnimator.ofFloat(1f, 0.3f).apply {
-                duration = 900; repeatMode = ValueAnimator.REVERSE; repeatCount = ValueAnimator.INFINITE
-                addUpdateListener { p.dot.alpha = it.animatedValue as Float }
-                start()
-            }
-        } else if (!animate) { p.pulse?.cancel(); p.pulse = null; p.dot.alpha = if (paused || stoppedNote) 0.4f else 1f }
-        (p.dot.background as? GradientDrawable)?.setColor(if (paused || stoppedNote) colors().muted else colors().accent)
+        val text = when {
+            stoppedNote -> s(R.string.overlay_stopped)
+            waiting() -> s(R.string.overlay_waiting)
+            paused -> s(R.string.overlay_paused_short)
+            else -> steerNote ?: base.text
+        }
+        val sep = s(R.string.overlay_meta_separator)
+        val app = debugApp ?: PhoneControl.peek()?.liveTask()?.app
+        val meta = listOfNotNull(app, if (base.waived) s(R.string.overlay_waived) else null).joinToString(sep).ifEmpty { null }
+        val state = CapsuleState(
+            line = text,
+            look = look,
+            paused = paused,
+            stopped = stoppedNote,
+            expandable = !stoppedNote && !waiting(),
+            unlocked = u.any,
+            unlockedLine = if (u.any) unlockedLine(u) else null,
+            meta = meta,
+            steps = steps.before(base, StepHistory.CAPACITY),
+        )
+        p.render(state, animated && p.root.isShown && !ballShown, now())
+        main.removeCallbacks(shrinkTick)
+        p.shrinkAt?.let { main.postAtTime(shrinkTick, it + 1) }
         ball?.setLook(
-            when {
-                stoppedNote -> OverlayBall.Look.STOPPED
-                paused -> OverlayBall.Look.PAUSED
-                else -> OverlayBall.Look.RUNNING
-            },
-            AppStrings.get(
-                service,
-                when {
-                    stoppedNote -> R.string.overlay_ball_stopped
-                    paused -> R.string.overlay_ball_paused
-                    else -> R.string.overlay_ball_running
+            look,
+            s(
+                when (look) {
+                    MarkLook.STOPPED -> R.string.overlay_ball_stopped
+                    MarkLook.WAITING -> R.string.overlay_ball_waiting
+                    MarkLook.PAUSED -> R.string.overlay_ball_paused
+                    MarkLook.RUNNING -> R.string.overlay_ball_running
                 },
             ),
+            badge = u.any && !stoppedNote,
+            stopLabel = if (stoppedNote) null else s(R.string.overlay_stop_description),
         )
+        syncPreview()
     }
 
-    /** Takes the pill and its ball away; [animated]: they fade first (a task that ended, not a rebuild). */
-    private fun removePill(animated: Boolean) {
+    /** 「已解除限制」 in bold over what is lifted (「系统设置、密码和验证码」), a size smaller. */
+    private fun unlockedLine(u: PhoneUnlocks): CharSequence {
+        val names = listOfNotNull(
+            if (u.systemPages) s(R.string.overlay_unlock_system) else null,
+            if (u.secretFields) s(R.string.overlay_unlock_secrets) else null,
+            if (u.ownApp) s(R.string.overlay_unlock_own_app) else null,
+        ).joinToString(s(R.string.overlay_list_separator))
+        val title = s(R.string.overlay_unlocked)
+        return SpannableStringBuilder(title).apply {
+            setSpan(StyleSpan(Typeface.BOLD), 0, title.length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            append('\n')
+            val at = length
+            append(names)
+            setSpan(RelativeSizeSpan(12f / 13f), at, length, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+        }
+    }
+
+    /** Takes the control away; [animated]: it fades first (a task that ended, not a rebuild). */
+    private fun removePill(animated: Boolean, preservePrompts: Boolean = false) {
+        clearPreview()
         val p = pill ?: return
         endEditing()
-        cancelMorph()
         main.removeCallbacks(foldTick)
+        main.removeCallbacks(shrinkTick)
         fold.reset()
-        dimAnim?.cancel()
-        dimAnim = null
-        surfaceAlpha = 1f
-        p.pulse?.cancel()
+        if (preservePrompts) {
+            if (waiting()) fold.hold(FoldClock.Hold.CONFIRM, now())
+            if (handoffCard != null) fold.hold(FoldClock.Hold.HANDOFF, now())
+        }
         val b = ball
         pill = null
         ball = null
         ballShown = false
+        steerNote = null
+        p.cancelMorph()
         val roots = listOfNotNull(p.root.takeIf { it.isShown }, b?.root?.takeIf { it.isShown })
         if (!animated || !animationsOn() || roots.isEmpty()) {
             remove(p.root)
@@ -432,106 +647,54 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         b?.cancelGlide()
         var left = roots.size
         for (r in roots) {
-            r.animate().alpha(0f).setDuration(160).setInterpolator(easing).withEndAction {
+            r.animate().alpha(0f).scaleX(0.96f).scaleY(0.96f).setDuration(180).setInterpolator(OverlayMotion.emphasized).withEndAction {
                 if (--left == 0) { remove(p.root); b?.detach() }
             }.start()
         }
     }
 
-    private fun buildPill(): Pill {
+    private fun buildPill(): OverlayCapsule {
         val c = colors()
-        val root = object : FrameLayout(service) {
-            // Any finger on the pill restarts its fold count (ACTION_OUTSIDE is someone else's touch).
-            override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-                if (ev.actionMasked == MotionEvent.ACTION_DOWN) onPillTouched()
-                return super.dispatchTouchEvent(ev)
+        val strings = OverlayCapsule.Strings(
+            fold = s(R.string.overlay_fold), expand = s(R.string.overlay_expand), collapse = s(R.string.overlay_collapse),
+            pause = s(R.string.overlay_pause_description), resume = s(R.string.overlay_resume_description),
+            stop = s(R.string.overlay_stop_description), steerHint = s(R.string.overlay_steer_hint), send = s(R.string.overlay_send),
+            unlocksDescription = s(R.string.overlay_unlocked_description), review = s(R.string.overlay_unlocks_review),
+            foldRow = s(R.string.overlay_fold_row), holdHint = s(R.string.overlay_hold_hint),
+        )
+        lateinit var capsule: OverlayCapsule
+        val actions = object : OverlayCapsule.Actions {
+            override fun touched() = onPillTouched()
+            override fun mark() = collapseByHand()
+            override fun line() = onLineTapped()
+            override fun pause() = togglePause()
+            override fun stop() = stopFromPill()
+            override fun unlocks() = openUnlocks()
+            override fun steer() = startSteer()
+            override fun send() = sendInterjection()
+            override fun inputDone() = endEditing()
+        }
+        capsule = OverlayCapsule(service, c, strings, actions) { update(capsule.root, capsule.params) }
+        capsule.root.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
+            override fun onViewAttachedToWindow(view: View) = Unit
+            override fun onViewDetachedFromWindow(view: View) {
+                if (previewPill === capsule) clearPreview()
             }
-        }.apply { setPadding(dp(6), dp(4), dp(6), dp(8)); clipToPadding = false }
-        val card = LinearLayout(service).apply {
-            orientation = LinearLayout.VERTICAL
-            background = surface(c, dp(22).toFloat())
-            elevation = dp(3).toFloat()
-            // The fold narrows the card to a circle; what doesn't fit is cut along its outline.
-            clipToOutline = true
-        }
-        // Both ends mirror each other: the dot's centre and the collapse key's centre sit 22 dp in,
-        // on the centres of the card's round ends (the card is 44 dp tall).
-        val row = LinearLayout(service).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            minimumHeight = dp(END_DP)
-            setPadding(dp(END_DP / 2 - 4), 0, 0, 0)
-        }
-        val dot = View(service).apply { background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(c.accent) } }
-        row.addView(dot, LinearLayout.LayoutParams(dp(8), dp(8)).apply { marginEnd = dp(10) })
-        val unlocked = TextView(service).apply {
-            text = AppStrings.get(service, R.string.overlay_unlocked)
-            contentDescription = AppStrings.get(service, R.string.overlay_unlocked_description)
-            textSize = 11f; setTextColor(c.danger); typeface = Typeface.DEFAULT_BOLD
-            gravity = Gravity.CENTER; maxLines = 1
-            // Even padding: the tag reads as a small capsule level with the text beside it.
-            setPadding(dp(8), dp(3), dp(8), dp(3))
-            background = GradientDrawable().apply {
-                cornerRadius = dp(10).toFloat()
-                setColor((c.danger and 0x00FFFFFF) or 0x24000000)
-            }
-            isClickable = true
-            isFocusable = true
-            setOnClickListener { openUnlocks() }
-            visibility = if (PhoneRegistry.unlocks().any) View.VISIBLE else View.GONE
-        }
-        row.addView(unlocked, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { marginEnd = dp(8) })
-        val text = HaloText(service).apply {
-            textSize = 14f; setTextColor(c.ink); maxLines = 1; ellipsize = TextUtils.TruncateAt.END
-            setPadding(0, dp(10), dp(6), dp(10))
-            contentDescription = null
-            setOnClickListener { toggleInput() }
-            halo(this, c)
-        }
-        row.addView(text, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        val pause = textButton(AppStrings.get(service, R.string.overlay_pause), c.accent, c, withHalo = true) { togglePause() }
-        val stop = textButton(AppStrings.get(service, R.string.overlay_stop), c.danger, c, withHalo = true) { stopFromPill() }
-        val collapse = CollapseKey(service, c).apply {
-            contentDescription = AppStrings.get(service, R.string.overlay_collapse)
-            setOnClickListener { collapseByHand() }
-        }
-        row.addView(pause)
-        row.addView(stop)
-        row.addView(collapse, LinearLayout.LayoutParams(dp(END_DP), dp(END_DP)))
-        card.addView(row)
-
-        val inputRow = LinearLayout(service).apply {
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            setPadding(dp(14), 0, dp(6), dp(8))
-        }
-        val input = object : EditText(service) {
-            override fun onKeyPreIme(keyCode: Int, event: KeyEvent?): Boolean {
-                if (keyCode == KeyEvent.KEYCODE_BACK && event?.action == KeyEvent.ACTION_UP) { collapseInput(); return true }
-                return super.onKeyPreIme(keyCode, event)
-            }
-        }.apply {
-            textSize = 15f; setTextColor(c.ink); setHintTextColor(c.faint)
-            hint = AppStrings.get(service, R.string.overlay_steer_hint)
-            background = GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(c.field) }
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE
-            imeOptions = EditorInfo.IME_ACTION_SEND or EditorInfo.IME_FLAG_NO_EXTRACT_UI
-            maxLines = 3
-            filters = arrayOf(InputFilter.LengthFilter(2000))
-            setOnEditorActionListener { _, action, _ -> if (action == EditorInfo.IME_ACTION_SEND) { sendInterjection(); true } else false }
-        }
-        inputRow.addView(input, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        inputRow.addView(textButton(AppStrings.get(service, R.string.overlay_send), c.accent, c) { sendInterjection() })
-        card.addView(inputRow)
-        root.addView(card, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-        root.setOnTouchListener { _, e -> if (e.actionMasked == MotionEvent.ACTION_OUTSIDE && editing) collapseInput(); false }
-
-        val params = params(top = true, keepScreenOn = true)
-        place(root, params, top = true)
-        return Pill(root, params, card, row, text, dot, pause, stop, collapse, inputRow, input, null, unlocked)
+        })
+        capsule.params = params(top = true, keepScreenOn = true)
+        placeCapsule(capsule)
+        return capsule
     }
 
-    /** The 「已解除限制」 tag: 设置 › 手机操控 › 解除限制, through the app's own page link. */
+    /** Centred at the top, [CapsuleMetrics.TOP_GAP_DP] under the status bar; sizes for this screen. */
+    private fun placeCapsule(p: OverlayCapsule) {
+        val a = safeArea()
+        p.params.y = a.top + dp(CapsuleMetrics.TOP_GAP_DP) - p.padTop
+        p.place(a.screenW, a.screenH)
+        update(p.root, p.params)
+    }
+
+    /** The 「已解除限制」 row: 设置 › 手机操控 › 解除限制, through the app's own page link. */
     private fun openUnlocks() {
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(UNLOCKS_LINK))
             .setClass(service, LinkTrampolineActivity::class.java)
@@ -540,56 +703,79 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     }
 
     private fun togglePause() {
-        paused = !paused
+        if (stoppedNote) return
+        val controls = statusOwnership.controls ?: return
+        val next = !controls.isPaused()
+        if (!controls.setPaused(next)) {
+            announce(s(R.string.overlay_control_rejected))
+            return
+        }
+        paused = next
         renderPill()
-        PhoneRegistry.controlListener?.onPauseChanged(paused)
+        announce(s(if (paused) R.string.overlay_paused_short else R.string.overlay_resume_description))
     }
 
+    /** Stop only the displayed task; its native owner chain cancels its own prompt tickets. */
     private fun stopFromPill() {
-        sharedPrompt?.ticket?.stop()
-        pendingConfirm?.resolve(Decision.STOP)
-        pendingHandoff?.resolve(HandoffResult.STOP)
-        dismissConfirm()
-        dismissHandoff()
+        if (stoppedNote) return
+        val controls = statusOwnership.controls ?: return
+        // l10n:keep agent stop reason
+        if (!controls.stop("你在悬浮条上点了停止")) {
+            announce(s(R.string.overlay_control_rejected))
+            return
+        }
         paused = false
-        setStopped(true)
         endEditing()
+        setStopped(true)
         renderPill()
         clearStoppedLater()
-        // l10n:keep agent stop reason
-        PhoneRegistry.controlListener?.onStopRequested("你在悬浮条上点了停止")
+        announce(s(R.string.overlay_stopped))
     }
 
-    private fun toggleInput() {
+    private fun announce(text: String) {
+        val v = if (ballShown) ball?.root else pill?.root
+        if (a11y.isEnabled) v?.announceForAccessibility(text)
+    }
+
+    /** The line: the capsule opens into the card, the card closes. */
+    private fun onLineTapped() {
         val p = pill ?: return
-        if (stoppedNote) return
-        if (p.inputRow.visibility == View.VISIBLE) collapseInput() else {
-            p.inputRow.visibility = View.VISIBLE
-            editing = true
-            holdFold(FoldClock.Hold.EDITING)
-            p.params.flags = p.params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
-            update(p.root, p.params)
-            p.input.requestFocus()
-            p.input.post { if (editing) ime.showSoftInput(p.input, InputMethodManager.SHOW_IMPLICIT) }
+        if (stoppedNote || ballShown) return
+        if (fold.expanded) {
+            endEditing()
+            if (fold.collapse(now())) p.collapse(animationsOn())
+        } else if (fold.expand(now())) {
+            applyIdle(animated = true)
+            renderPill(animated = false)
+            p.expand(animationsOn())
         }
+        scheduleFold()
     }
 
-    private fun collapseInput() {
+    /** The steer field in the card: the window takes the keyboard until the text goes or is sent. */
+    private fun startSteer() {
         val p = pill ?: return
-        p.inputRow.visibility = View.GONE
-        endEditing()
+        if (stoppedNote || !fold.expanded || editing || !statusOwnership.beginEditing()) return
+        editing = true
+        holdFold(FoldClock.Hold.EDITING)
+        p.params.flags = p.params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE.inv()
+        update(p.root, p.params)
+        p.startEditing()
+        p.input.post { if (editing) ime.showSoftInput(p.input, InputMethodManager.SHOW_IMPLICIT) }
     }
 
     private fun endEditing() {
+        statusOwnership.endEditing()
         val p = pill
-        if (p != null) {
+        p?.input?.setText("")
+        p?.input?.error = null
+        if (p != null && (editing || p.editing)) {
             ime.hideSoftInputFromWindow(p.input.windowToken, 0)
-            p.input.clearFocus()
+            p.stopEditing()
             if (p.params.flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE == 0) {
                 p.params.flags = p.params.flags or WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                 update(p.root, p.params)
             }
-            p.inputRow.visibility = View.GONE
         }
         editing = false
         releaseFold(FoldClock.Hold.EDITING)
@@ -599,11 +785,22 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         val p = pill ?: return
         val text = p.input.text?.toString()?.trim().orEmpty()
         if (text.isEmpty()) return
-        p.input.setText("")
-        collapseInput()
-        PhoneRegistry.controlListener?.onInterject(text)
-        p.text.text = AppStrings.get(service, R.string.overlay_steer_sent, text)
-        main.postDelayed({ if (pill === p) renderPill() }, 2_500)
+        val controls = statusOwnership.editingControls
+        if (controls == null || !controls.interject(text)) {
+            val failure = s(R.string.overlay_steer_rejected)
+            p.input.error = failure
+            announce(failure)
+            return
+        }
+        p.input.error = null
+        endEditing()
+        val note = s(R.string.overlay_steer_sent, text)
+        steerNote = note
+        // Back to the capsule: the note shows where the line is.
+        if (fold.collapse(now())) p.collapse(animationsOn())
+        renderPill()
+        scheduleFold()
+        main.postDelayed({ if (pill === p && steerNote == note) { steerNote = null; renderPill() } }, 2_500)
     }
 
     // ---- confirm --------------------------------------------------------------------------------
@@ -624,6 +821,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         sharedPrompt = p
         confirmCard = Card(root, layout, null)
         holdFold(FoldClock.Hold.CONFIRM)
+        renderPill()
         return {
             if (sharedPrompt === p) {
                 sharedPrompt = null
@@ -678,8 +876,16 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         // 本任务免确认: the main choice waives the rest of the task. Otherwise, on the first action
         // in an app, the main choice allows that app for the rest of the task so later steps there
         // don't ask again. "Only this step" stays available as the quieter option either way.
-        val wide = request.offerTaskWaiver || request.firstInApp
-        if (request.offerTaskWaiver) {
+        val wide = request.visualScope != null || request.offerTaskWaiver || request.firstInApp
+        if (request.visualScope != null) {
+            val visual = GuardedButton(service, armedAt).apply {
+                text = AppStrings.get(service, R.string.phone_prompt_allow_visual)
+                style(this, c.accent, c.onAccent, c)
+                setOnClickListener { decide(Decision.ALLOW_VISUAL_FOR_TASK) }
+            }
+            guarded += visual
+            card.addView(visual, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(46)).apply { bottomMargin = dp(8) })
+        } else if (request.offerTaskWaiver) {
             val all4task = GuardedButton(service, armedAt).apply {
                 text = AppStrings.get(service, R.string.overlay_allow_remaining)
                 style(this, c.accent, c.onAccent, c)
@@ -703,7 +909,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
             LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, dp(46)).apply { marginEnd = dp(8) })
         val allow = GuardedButton(service, armedAt).apply {
             text = if (wide) AppStrings.get(service, R.string.overlay_allow_step) else AppStrings.get(service, R.string.overlay_allow_once)
-            if (wide) style(this, c.tonal, c.onTonal, c) else style(this, c.accent, c.onAccent, c)
+            if (wide) style(this, c.accentSoft, c.onAccentSoft, c) else style(this, c.accent, c.onAccent, c)
             setOnClickListener { decide(Decision.ALLOW_ONCE) }
         }
         guarded += allow
@@ -731,6 +937,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         tick.run()
         enter(root)
         holdFold(FoldClock.Hold.CONFIRM)
+        renderPill()
         return true
     }
 
@@ -741,6 +948,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         confirmCard = null
         pendingConfirm = null
         releaseFold(FoldClock.Hold.CONFIRM)
+        renderPill()
     }
 
     // ---- handoff --------------------------------------------------------------------------------
@@ -803,7 +1011,7 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         if (pending.value != null) { remove(root); return false }
         handoffCard = Card(root, params, tick)
         pendingHandoff = pending
-        // The card says it all: pill and ball step aside, and the pill comes back open after.
+        // The card says it all: capsule and ball step aside, and the capsule comes back after.
         holdFold(FoldClock.Hold.HANDOFF)
         syncWindows()
         tick.run()
@@ -828,15 +1036,13 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
      *  - not in its first [ARM_MS] (a tap already in flight when the card appeared);
      *  - not while this service is injecting a gesture (InjectGuard);
      *  - not when the touch came through another window on top (tapjacking, FLAG_WINDOW_IS_OBSCURED);
-     *  - not when it looks like an accessibility service's stroke: a virtual device (id ≤ 0) and
-     *    either FLAG_IS_ACCESSIBILITY_EVENT (0x800) or tool type UNKNOWN — unless TalkBack-style
-     *    touch exploration is on, whose double-tap takes that same path;
-     *  - ACTION_CLICK from any accessibility service is refused unless touch exploration is on.
+     *  - ACTION_CLICK from an accessibility service only while touch exploration (TalkBack) is on,
+     *    and never while this service is acting itself.
      * And the Actuator makes the overlay untouchable for every stroke it injects.
-     * Measured on the API 35 emulator (debug probe): our dispatchGesture tap = flags 0x800,
-     * device -1, tool UNKNOWN; a hardware-touchscreen tap = flags 0x800 (!), device 12, tool FINGER;
-     * shell `input tap` = flags 0, device -1, tool FINGER. So 0x800 alone would lock real fingers
-     * out; the device id is what separates them.
+     * Event fields don't decide: on OPPO / realme a real finger arrives with device -1 and flags
+     * 0x800, like our own dispatchGesture tap (#608, #296), so guessing from them locked real users
+     * out. What the card guards against is the assistant, and every input it sends is ours and marked
+     * (PromptInputPolicy has the full rule).
      */
     private inner class GuardedButton(context: Context, private val armedAt: Long) : TextView(context) {
         private var rejected = false
@@ -858,7 +1064,8 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         }
 
         override fun performAccessibilityAction(action: Int, arguments: Bundle?): Boolean {
-            if ((action == AccessibilityNodeInfo.ACTION_CLICK || action == AccessibilityNodeInfo.ACTION_LONG_CLICK) && !a11y.isTouchExplorationEnabled) {
+            if ((action == AccessibilityNodeInfo.ACTION_CLICK || action == AccessibilityNodeInfo.ACTION_LONG_CLICK) &&
+                (!a11y.isTouchExplorationEnabled || InjectGuard.active() || SystemClock.uptimeMillis() < armedAt)) {
                 lastGuardVerdict = "accessibility-action"
                 Log.i(TAG, "guarded '$text': refused accessibility click")
                 return false
@@ -870,65 +1077,73 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
             SystemClock.uptimeMillis() < armedAt -> "too-early"
             InjectGuard.active() && !debugIgnoreInjectGuard -> "injecting"
             event.flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0 -> "obscured"
-            event.deviceId <= 0 && (event.flags and FLAG_IS_ACCESSIBILITY_EVENT != 0 || event.getToolType(0) == MotionEvent.TOOL_TYPE_UNKNOWN) &&
-                !a11y.isTouchExplorationEnabled -> "accessibility-injected"
             else -> null
         }
     }
 
-    // ---- fold ------------------------------------------------------------------------------------
+    // ---- forms -----------------------------------------------------------------------------------
     //
-    // Folding: the card narrows to a circle at its end on the ball's side, row fading first, the
-    // ball takes its place and glides to its dock. Unfolding: the ball glides back to that end and
-    // the card grows out of it. One window shows at a time, except a few frames of overlap at the
-    // swap (both are the same circle there), so neither ever blinks.
+    // Folding: the surface narrows to the circle at its end on the ball's side, the row fading
+    // first; the ball takes its place and glides to its dock. Unfolding: the ball glides back to
+    // that end and the capsule grows out of it. Capsule ↔ card: the same surface grows down and
+    // out, the body fading in behind (OverlayCapsule). One window shows at a time, except a few
+    // frames of overlap at the swap (both are the same circle there), so neither ever blinks.
 
     private fun now() = SystemClock.uptimeMillis()
 
     private fun scheduleFold() {
+        syncPreview()
         main.removeCallbacks(foldTick)
+        if (debugFreeze) return
         val at = fold.nextAt ?: return
         main.postAtTime(foldTick, at)
     }
 
     private fun onFoldTick() {
+        if (debugFreeze) return
         when (fold.tick(now())) {
             FoldClock.Tick.FOLD -> foldPill(animationsOn())
-            FoldClock.Tick.DIM -> applyDim(animated = true)
+            FoldClock.Tick.COLLAPSE -> pill?.collapse(animationsOn())
+            FoldClock.Tick.DIM -> applyIdle(animated = true)
             FoldClock.Tick.NONE -> Unit
         }
         scheduleFold()
     }
 
     private fun onPillTouched() {
-        // A touch on a pill that is still shrinking opens it again.
-        if (fold.folded && !ballShown) { fold.unfold(now()); unfoldPill(animationsOn()) } else fold.touch(now())
-        applyDim(animated = true)
+        // A touch on a capsule that is still shrinking into the ball opens it again.
+        if (fold.folded && !ballShown) {
+            fold.unfold(now())
+            pill?.cancelMorph()
+        } else if (fold.touch(now())) applyIdle(animated = true)
         scheduleFold()
     }
 
     private fun onBallTouched() {
+        // A finger stops an unfold's glide: the capsule it had brought up (transparent) goes again.
+        syncWindows()
         fold.touch(now())
-        applyDim(animated = true)
+        applyIdle(animated = true)
         scheduleFold()
     }
 
     private fun onBallTapped() {
         if (fold.unfold(now())) unfoldPill(animationsOn())
-        applyDim(animated = true)
+        applyIdle(animated = true)
         scheduleFold()
     }
 
-    /** The collapse key: folded until the ball is tapped, for the rest of this task. */
+    /** The mark (or the card's 收成小球): folded until the ball is tapped, for the rest of this task. */
     private fun collapseByHand() {
+        endEditing()
         if (fold.foldByHand(now())) foldPill(animationsOn())
         scheduleFold()
     }
 
     private fun holdFold(hold: FoldClock.Hold) {
-        // A handoff hides both anyway: open without a show.
-        if (fold.hold(hold, now())) unfoldPill(animationsOn() && hold != FoldClock.Hold.HANDOFF)
-        applyDim(animated = true)
+        // A handoff hides both anyway: change form without a show.
+        if (fold.hold(hold, now())) syncForm(animationsOn() && hold != FoldClock.Hold.HANDOFF)
+        applyIdle(animated = true)
         scheduleFold()
     }
 
@@ -937,222 +1152,141 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         scheduleFold()
     }
 
+    /** Brings what is on screen to the form [fold] says. */
+    private fun syncForm(animated: Boolean) {
+        val p = pill ?: return
+        when (fold.form) {
+            FoldClock.Form.BALL -> if (!ballShown) foldPill(animated)
+            FoldClock.Form.CAPSULE -> when {
+                ballShown -> unfoldPill(animated)
+                p.shape == OverlayCapsule.Shape.CARD -> { endEditing(); p.collapse(animated) }
+            }
+            FoldClock.Form.CARD -> if (!ballShown && p.shape != OverlayCapsule.Shape.CARD) p.expand(animated)
+        }
+    }
+
     private fun onPrefsChanged() {
         val p = OverlayPrefs.from(overlayPrefs)
         idleOpacity = p.idleOpacity
         fold.setAutoFold(p.autoFold, now())
-        // A new 不透明度 shows at once on a dimmed pill or ball.
-        applyDim(animated = false)
+        // A new 不透明度 shows at once on a faded ball or capsule.
+        applyIdle(animated = false)
         scheduleFold()
     }
 
     /**
-     * Fades the surfaces (pill card and ball) to the idle opacity, or back to full: slowly going
-     * idle, quickly on a touch. Text and keys never fade: their halo (see [halo]) keeps them
-     * readable on whatever the page shows through.
+     * The ball or the capsule fades, all of it alike, to the idle opacity, or comes back to full:
+     * slowly going idle, quickly on a touch. The card never fades. The form not on screen is kept
+     * at full, ready for the next fold or unfold.
      */
-    private fun applyDim(animated: Boolean) {
+    private fun applyIdle(animated: Boolean) {
         val target = if (fold.dimmed) idleOpacity else 1f
-        dimAnim?.cancel()
-        dimAnim = null
-        if (target == surfaceAlpha) return
-        if (!animated || !animationsOn()) {
-            setSurfaceAlpha(target)
-            return
-        }
-        dimAnim = ValueAnimator.ofFloat(surfaceAlpha, target).apply {
-            duration = if (target < surfaceAlpha) DIM_FADE_MS else UNDIM_FADE_MS
-            interpolator = easing
-            addUpdateListener { setSurfaceAlpha(it.animatedValue as Float) }
-            start()
-        }
+        val durationMs = if (target < 1f) DIM_FADE_MS else UNDIM_FADE_MS
+        ball?.setIdle(if (fold.folded) target else 1f, animated, durationMs)
+        pill?.setIdle(if (fold.folded) 1f else target, animated, durationMs)
     }
 
-    private fun setSurfaceAlpha(a: Float) {
-        surfaceAlpha = a
-        pill?.let { p -> (p.card.background as? GradientDrawable)?.alpha = (255 * a).roundToInt() }
-        ball?.setSurfaceAlpha(a)
-    }
-
-    /** The ball's window for this pill, added (hidden) on first use; null when the system refused it. */
+    /** The ball's window for this control, added (hidden) on first use; null when the system refused it. */
     private fun ensureBall(): OverlayBall? {
         ball?.let { return it }
-        val b = OverlayBall(service, wm, ::safeArea, ::onBallTapped, ::onBallTouched)
-        val c = colors()
-        b.setColors(OverlayBall.Colors(c.top, c.bottom, c.stroke, c.accent, c.muted))
-        b.setSurfaceAlpha(surfaceAlpha)
-        if (!b.attach(AppStrings.get(service, R.string.overlay_window_title), passThrough, b.dockPos())) return null
+        val b = OverlayBall(service, wm, ::safeArea, colors(), ::onBallTapped, ::stopFromPill, ::onBallTouched)
+        if (!b.attach(s(R.string.overlay_window_title), passThrough, b.dockPos())) return null
         ball = b
-        renderPill()
+        renderPill(animated = false)
         return b
     }
 
+    /** The ball window over the surface's circle at ([circle]) in the capsule window. */
+    private fun ballOver(p: OverlayCapsule, b: OverlayBall, circle: Pair<Int, Int>): WindowPos = BallGeometry.ballOver(
+        windowX = BallGeometry.centredX(safeArea().screenW, p.params.width), windowY = p.params.y,
+        padX = p.padX, padTop = p.padTop, circleLeft = circle.first, circleTop = circle.second, pad = b.pad,
+    )
+
     private fun foldPill(animated: Boolean) {
         val p = pill ?: return
-        cancelMorph()
+        if (ballShown) return
+        endEditing()
         val b = ensureBall()
         if (b == null) {
-            // No second window: the pill stays as it was.
+            // No second window: the capsule stays as it was.
             fold.unfold(now())
             scheduleFold()
             return
         }
-        // Folding is a change worth seeing: at full from here, dimming again later.
-        applyDim(animated = false)
-        val shown = animated && p.root.isShown && p.card.width > 0
+        // Folding is a change worth seeing: at full from here, fading again later.
+        applyIdle(animated = false)
+        val shown = animated && p.root.isShown && p.surface.width > 0
         if (!shown) {
+            p.cancelMorph()
+            p.settle(OverlayCapsule.Shape.CAPSULE)
             b.move(b.dockPos())
             b.fadeMark(1f, animated = false)
             ballShown = true
             syncWindows()
-            renderPill()
+            renderPill(animated = false)
             return
         }
         val side = b.dock.side
-        b.move(pillEnd(p, side))
-        morph = shapeCard(p, side, grow = false) {
+        b.move(ballOver(p, b, p.endCircle(side)))
+        p.foldTo(side, animated = true) {
             ballShown = true
             b.fadeMark(0f, animated = false)
             showWindow(b.root)
             b.fadeMark(1f, animated = true)
-            // The pill goes (and gets its plain layout back) once the ball is surely drawn over it.
-            b.root.postDelayed({ if (pill === p && ballShown) { syncWindows(); restoreCard(p) } }, SWAP_MS)
-            renderPill()
+            // The capsule goes (and gets its plain layout back) once the ball is surely drawn over it.
+            b.root.postDelayed({ if (pill === p && ballShown) { syncWindows(); p.settle(OverlayCapsule.Shape.CAPSULE) } }, SWAP_MS)
+            renderPill(animated = false)
             b.glideTo(b.dockPos(), animated = true)
         }
     }
 
     private fun unfoldPill(animated: Boolean) {
         val p = pill ?: return
-        cancelMorph()
         val b = ball
         if (b == null || !ballShown) {
-            restoreCard(p)
             ballShown = false
             syncWindows()
             renderPill()
             return
         }
         if (!animated || captureHidden || !b.root.isShown) {
+            p.settle(OverlayCapsule.Shape.CAPSULE)
             b.move(b.dockPos())
             ballShown = false
             syncWindows()
-            renderPill()
+            renderPill(animated = false)
             return
         }
         // Only the ball shows from here (a fold may have just ended with both up).
         syncWindows()
         val side = b.dock.side
-        // The ball goes back to the pill's end first, its mark fading (cancelMorph stops this glide too).
+        // The capsule window comes up now, transparent, as the circle the ball is heading for:
+        // drawn before the swap, so the morph starts on its first frame instead of popping in late.
+        renderPill(animated = false)
+        p.prepareUnfold(side)
+        p.root.alpha = 0f
+        p.root.visibility = if (captureHidden) View.INVISIBLE else View.VISIBLE
+        // The ball goes back to the capsule's end first, its mark fading.
         b.fadeMark(0f, animated = true, durationMs = UNFOLD_GLIDE_MS)
-        b.glideTo(pillEnd(p, side), animated = true, durationMs = UNFOLD_GLIDE_MS) {
+        b.glideTo(ballOver(p, b, p.capsuleEndCircle(side)), animated = true, durationMs = UNFOLD_GLIDE_MS) {
             if (pill !== p || !ballShown) return@glideTo
             ballShown = false
-            morph = shapeCard(p, side, grow = true) { restoreCard(p) }
             showWindow(p.root)
-            // The ball goes once the pill is surely drawn over it, back to its dock for next time.
+            p.unfoldFrom(side, animated = true) {}
+            // The ball goes once the capsule is surely drawn over it, back to its dock for next time.
             b.root.postDelayed({
                 if (pill === p && !ballShown) { syncWindows(); b.move(b.dockPos()); b.fadeMark(1f, animated = false) }
             }, SWAP_MS)
-            renderPill()
         }
-    }
-
-    /** Ends a fold or unfold where it stands (the ball's glide too), the pill back in its plain layout. */
-    private fun cancelMorph() {
-        ball?.cancelGlide()
-        val m = morph
-        morph = null
-        m?.cancel()
-        pill?.let { restoreCard(it) }
     }
 
     /**
-     * Narrows ([grow] false) or widens the card between its full width and a circle at the end on
-     * [side]. The row is pinned to that end at its full width, so nothing re-lays out while the
-     * card's outline cuts it; it fades in the first 40 % of a fold and the last half of an unfold.
-     */
-    private fun shapeCard(p: Pill, side: Side, grow: Boolean, then: () -> Unit): Animator {
-        val full = fullCardWidth(p)
-        val circle = dp(OverlayBall.BALL_DP)
-        prepareCard(p, side, narrow = grow)
-        val lp = p.card.layoutParams as FrameLayout.LayoutParams
-        return ValueAnimator.ofFloat(0f, 1f).apply {
-            duration = MORPH_MS
-            interpolator = easing
-            addUpdateListener { a ->
-                val t = a.animatedValue as Float
-                val k = if (grow) t else 1f - t
-                lp.width = (circle + (full - circle) * k).roundToInt()
-                p.card.layoutParams = lp
-                p.row.alpha = if (grow) ((t - 0.5f) / 0.5f).coerceIn(0f, 1f) else (1f - t / 0.4f).coerceIn(0f, 1f)
-            }
-            addListener(object : AnimatorListenerAdapter() {
-                private var cancelled = false
-
-                override fun onAnimationCancel(animation: Animator) {
-                    cancelled = true
-                }
-
-                override fun onAnimationEnd(animation: Animator) {
-                    if (morph === animation) morph = null
-                    if (!cancelled) then()
-                }
-            })
-            start()
-        }
-    }
-
-    /** Pins the card to [side] at its full width, or at the circle when [narrow]; the row likewise. */
-    private fun prepareCard(p: Pill, side: Side, narrow: Boolean) {
-        val full = fullCardWidth(p)
-        val end = if (side == Side.RIGHT) Gravity.END else Gravity.START
-        val lp = p.card.layoutParams as FrameLayout.LayoutParams
-        lp.width = if (narrow) dp(OverlayBall.BALL_DP) else full
-        lp.gravity = end or Gravity.TOP
-        p.card.layoutParams = lp
-        val rowLp = p.row.layoutParams as LinearLayout.LayoutParams
-        rowLp.width = full
-        rowLp.gravity = end
-        p.row.layoutParams = rowLp
-        p.row.alpha = if (narrow) 0f else 1f
-    }
-
-    private fun restoreCard(p: Pill) {
-        val lp = p.card.layoutParams as FrameLayout.LayoutParams
-        if (lp.width != FrameLayout.LayoutParams.MATCH_PARENT) {
-            lp.width = FrameLayout.LayoutParams.MATCH_PARENT
-            lp.gravity = FrameLayout.LayoutParams.UNSPECIFIED_GRAVITY
-            p.card.layoutParams = lp
-        }
-        val rowLp = p.row.layoutParams as LinearLayout.LayoutParams
-        if (rowLp.width != LinearLayout.LayoutParams.MATCH_PARENT) {
-            rowLp.width = LinearLayout.LayoutParams.MATCH_PARENT
-            rowLp.gravity = -1
-            p.row.layoutParams = rowLp
-        }
-        p.row.alpha = 1f
-    }
-
-    /** The card's width when open: the window less the root's side padding. */
-    private fun fullCardWidth(p: Pill) = p.params.width - p.root.paddingLeft - p.root.paddingRight
-
-    /**
-     * The ball window's position that puts the ball on the card's end circle at [side] (the
-     * pill window is centred horizontally at `params.y`; its root pads the card).
-     */
-    private fun pillEnd(p: Pill, side: Side): WindowPos = BallGeometry.pillEnd(
-        screenW = safeArea().screenW, pillW = p.params.width, pillY = p.params.y,
-        padL = p.root.paddingLeft, padR = p.root.paddingRight, padTop = p.root.paddingTop,
-        ball = dp(OverlayBall.BALL_DP), pad = ball?.pad ?: dp(OverlayBall.PAD_DP), side = side,
-    )
-
-    /**
-     * Pill and ball visibility from the state: the handoff card hides both, a screenshot makes
+     * Capsule and ball visibility from the state: the handoff card hides both, a screenshot makes
      * them invisible for its moment, otherwise the one [ballShown] says. GONE windows take no
      * touches, so the hidden one is never in the way.
      */
     private fun syncWindows() {
+        syncPreview()
         val p = pill ?: return
         val handoff = handoffCard != null
         val shown = if (captureHidden) View.INVISIBLE else View.VISIBLE
@@ -1202,10 +1336,11 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     ).apply {
         gravity = (if (top) Gravity.TOP else Gravity.BOTTOM) or Gravity.CENTER_HORIZONTAL
         softInputMode = WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
-        title = AppStrings.get(service, R.string.overlay_window_title)
+        title = s(R.string.overlay_window_title)
         if (Build.VERSION.SDK_INT >= 30) setFitInsetsTypes(0)
     }
 
+    /** The confirm and handoff cards: nearly the screen's width, at the top or the bottom. */
     private fun place(root: View, params: WindowManager.LayoutParams, top: Boolean) {
         val (screenW, insetTop, insetBottom) = metrics()
         params.width = minOf(screenW - dp(12), dp(if (top) 492 else 472))
@@ -1231,6 +1366,13 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         confirmCard?.let { it.root to it.params }, handoffCard?.let { it.root to it.params },
     )
 
+    /** Main-thread identity check, including invisible roots during a display capture. */
+    internal fun ownsWindow(windowId: Int): Boolean = windowId >= 0 && windows().any { (root, _) ->
+        if (!root.isAttachedToWindow) return@any false
+        val node = root.createAccessibilityNodeInfo() ?: return@any false
+        try { node.windowId == windowId } finally { node.recycle() }
+    }
+
     private fun add(view: View, params: WindowManager.LayoutParams): Boolean = try {
         wm.addView(view, params); true
     } catch (e: Exception) { Log.w(TAG, "overlay addView failed", e); false }
@@ -1246,8 +1388,10 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
     private fun enter(view: View) {
         if (!animationsOn()) return
         view.alpha = 0f
-        view.translationY = dp(6).toFloat()
-        view.animate().alpha(1f).translationY(0f).setDuration(180).setInterpolator(easing).start()
+        view.translationY = -dp(6).toFloat()
+        view.scaleX = 0.96f
+        view.scaleY = 0.96f
+        view.animate().alpha(1f).translationY(0f).scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(OverlayMotion.emphasized).start()
     }
 
     /** Runs [block] on the main thread and waits for it; null on timeout. */
@@ -1273,37 +1417,21 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
 
     // ---- look -----------------------------------------------------------------------------------
 
-    private class Palette(
-        val top: Int, val bottom: Int, val stroke: Int, val ink: Int, val muted: Int, val faint: Int,
-        val accent: Int, val onAccent: Int, val tonal: Int, val onTonal: Int, val field: Int, val ripple: Int, val danger: Int,
-    )
-
-    // The app's 雾蓝 (mist) accent and surfaces, see app/lib/ui/theme/accent.dart and palette.dart.
-    private val light = Palette(
-        top = 0xFFFBFCFF.toInt(), bottom = 0xFFEEF1F9.toInt(), stroke = 0xCCDCE0E8.toInt(), ink = 0xFF1E232E.toInt(),
-        muted = 0xFF4F5562.toInt(), faint = 0xFF646974.toInt(), accent = 0xFF4B67B4.toInt(), onAccent = Color.WHITE,
-        tonal = 0xFFDEE8FF.toInt(), onTonal = 0xFF213262.toInt(), field = 0xFFE7EBF4.toInt(), ripple = 0x224B67B4, danger = 0xFFB3261E.toInt(),
-    )
-    private val dark = Palette(
-        top = 0xFF232730.toInt(), bottom = 0xFF1C1F28.toInt(), stroke = 0xCC343841.toInt(), ink = 0xFFE6E9F0.toInt(),
-        muted = 0xFFB6BBC5.toInt(), faint = 0xFF9A9EA9.toInt(), accent = 0xFF97B1F0.toInt(), onAccent = 0xFF121C34.toInt(),
-        tonal = 0xFF2E3C5F.toInt(), onTonal = 0xFFD8E1F6.toInt(), field = 0xFF2D323C.toInt(), ripple = 0x3397B1F0, danger = 0xFFFFB4AB.toInt(),
-    )
-
     private fun isDark() = debugDark
         ?: (service.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES)
-    private fun colors() = if (isDark()) dark else light
+    private fun colors() = if (isDark()) OverlayPalette.DARK else OverlayPalette.LIGHT
 
-    private fun surface(c: Palette, radius: Float) = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(c.top, c.bottom)).apply {
+    /** The confirm and handoff cards' surface: the control's, as a drawable. */
+    private fun surface(c: OverlayPalette, radius: Float) = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(c.surfaceTop, c.surfaceBottom)).apply {
         cornerRadius = radius
-        setStroke(dp(1), c.stroke)
+        setStroke(1, c.hairline)
     }
 
-    private fun outlined(c: Palette) = RippleDrawable(ColorStateList.valueOf(c.ripple), GradientDrawable().apply {
-        cornerRadius = dp(14).toFloat(); setStroke(dp(1), c.stroke); setColor(Color.TRANSPARENT)
+    private fun outlined(c: OverlayPalette) = RippleDrawable(ColorStateList.valueOf(c.ripple), GradientDrawable().apply {
+        cornerRadius = dp(14).toFloat(); setStroke(dp(1), c.outline); setColor(Color.TRANSPARENT)
     }, null)
 
-    private fun style(button: TextView, fill: Int, ink: Int, c: Palette) {
+    private fun style(button: TextView, fill: Int, ink: Int, c: OverlayPalette) {
         button.textSize = 15f
         button.setTextColor(ink)
         button.typeface = Typeface.DEFAULT_BOLD
@@ -1311,72 +1439,12 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         button.background = RippleDrawable(ColorStateList.valueOf(c.ripple), GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(fill) }, null)
     }
 
-    /**
-     * A rim of the card's own colour around the glyphs (see [HaloText]): invisible on the opaque
-     * pill; on a dimmed one it keeps the line readable over any page.
-     */
-    private fun halo(v: HaloText, c: Palette) {
-        v.haloColor = haloColor(c)
-        v.haloWidth = dpf(HALO_DP)
-    }
-
-    /** The card's colour halfway down its gradient, where the text sits, at the halo's strength. */
-    private fun haloColor(c: Palette): Int {
-        fun mix(shift: Int) = (((c.top shr shift) and 0xFF) + ((c.bottom shr shift) and 0xFF)) / 2
-        return Color.argb(HALO_ALPHA, mix(16), mix(8), mix(0))
-    }
-
-    /**
-     * The collapse key: Phosphor's arrows-in-simple, 22 dp in a 44 dp key at the card's right end
-     * (its pressed circle is 36 dp, 4 dp in from the card on three sides: concentric with the end).
-     */
-    private inner class CollapseKey(context: Context, private val c: Palette) : View(context) {
-        private val ink = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-            style = android.graphics.Paint.Style.STROKE
-            strokeCap = android.graphics.Paint.Cap.ROUND
-            strokeJoin = android.graphics.Paint.Join.ROUND
-        }
-        private val glyph = android.graphics.Path().apply {
-            // 256-unit grid, as Phosphor draws it.
-            moveTo(144f, 64f); lineTo(144f, 112f); lineTo(192f, 112f)
-            moveTo(208f, 48f); lineTo(144f, 112f)
-            moveTo(112f, 192f); lineTo(112f, 144f); lineTo(64f, 144f)
-            moveTo(48f, 208f); lineTo(112f, 144f)
-        }
-        private val scaled = android.graphics.Path()
-        private val matrix = android.graphics.Matrix()
-
-        init {
-            isClickable = true
-            isFocusable = true
-            val mask = android.graphics.drawable.InsetDrawable(GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.WHITE) }, dp(4))
-            background = RippleDrawable(ColorStateList.valueOf(c.ripple), null, mask)
-        }
-
-        override fun onDraw(canvas: android.graphics.Canvas) {
-            super.onDraw(canvas)
-            val size = dpf(22f)
-            val scale = size / 256f
-            matrix.setScale(scale, scale)
-            matrix.postTranslate((width - size) / 2f, (height - size) / 2f)
-            glyph.transform(matrix, scaled)
-            // Halo first (as the text's), then the glyph in the secondary ink.
-            ink.color = haloColor(c)
-            ink.strokeWidth = dpf(1.5f) + dpf(HALO_DP)
-            canvas.drawPath(scaled, ink)
-            ink.color = c.muted
-            ink.strokeWidth = dpf(1.5f)
-            canvas.drawPath(scaled, ink)
-        }
-    }
-
-    private fun textButton(label: String, ink: Int, c: Palette, withHalo: Boolean = false, action: () -> Unit) =
-        (if (withHalo) HaloText(service).also { halo(it, c) } else TextView(service)).apply {
+    private fun textButton(label: String, ink: Int, c: OverlayPalette, action: () -> Unit) = TextView(service).apply {
         text = label
         textSize = 14f
         setTextColor(ink)
         gravity = Gravity.CENTER
-        minimumHeight = dp(40)
+        minimumHeight = dp(48)
         minimumWidth = dp(48)
         setPadding(dp(12), 0, dp(12), 0)
         background = RippleDrawable(ColorStateList.valueOf(c.ripple), null, GradientDrawable().apply { cornerRadius = dp(14).toFloat(); setColor(Color.WHITE) })
@@ -1385,11 +1453,9 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         setOnClickListener { action() }
     }
 
-    private fun animationsOn() = if (Build.VERSION.SDK_INT >= 26) ValueAnimator.areAnimatorsEnabled() else true
+    private fun animationsOn() = OverlayMotion.on()
 
-    private fun dp(v: Int) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v.toFloat(), service.resources.displayMetrics).toInt()
-
-    private fun dpf(v: Float) = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, v, service.resources.displayMetrics)
+    private fun dp(v: Int) = service.dp(v)
 
     companion object {
         private const val TAG = "DshA11y"
@@ -1398,30 +1464,14 @@ internal class ControlOverlay(private val service: AccessibilityService) : UserG
         /** The app's page link for 解除限制 (lib/ui/settings/index/spots.dart). */
         private const val UNLOCKS_LINK = "dshgo://open/phone-unlocks"
 
-        /** The card's shrink and grow (the app's 胶囊变形, AppMotion.emphasized). */
-        private const val MORPH_MS = 340L
-
-        /** The ball's way back to the pill on a tap: quicker than the way out. */
+        /** The ball's way back to the capsule on a tap: quicker than the way out. */
         private const val UNFOLD_GLIDE_MS = 220L
 
         /** Frames both windows show at a swap, so the one going is surely covered (≈ 3 frames). */
         private const val SWAP_MS = 48L
 
-        /** The card's height and the size of the keys at its round ends. */
-        private const val END_DP = 44
-
         /** Going idle is slow and quiet; a touch brings it back at once. */
         private const val DIM_FADE_MS = 400L
         private const val UNDIM_FADE_MS = 120L
-
-        /** The halo's stroke: 1.75 dp of surface around every glyph stroke. */
-        private const val HALO_DP = 3.5f
-
-        /** Near-opaque: under the glyphs the page barely shows. */
-        private const val HALO_ALPHA = 0xE6
-
-        /** MotionEvent.FLAG_IS_ACCESSIBILITY_EVENT (hidden, API 31+). Not decisive alone, see GuardedButton. */
-        private const val FLAG_IS_ACCESSIBILITY_EVENT = 0x800
-
     }
 }

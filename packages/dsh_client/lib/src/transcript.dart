@@ -56,6 +56,7 @@ final class AssistantChatItem extends ChatItem {
     this.time,
     this.streaming = false,
     this.interrupted = false,
+    this.isFinalAnswer = false,
     this.usage,
     this.model,
     this.rowKey,
@@ -76,6 +77,9 @@ final class AssistantChatItem extends ChatItem {
 
   /// The turn was cancelled mid-stream; [text] is the delivered prefix.
   final bool interrupted;
+
+  /// The committed message contains explicitly marked final-answer text.
+  final bool isFinalAnswer;
   final TokenUsage? usage;
   final String? model;
 
@@ -164,8 +168,12 @@ class ChatTranscript {
   final Map<String, UserQuestionRequest> _questions = {};
   Map<String, List<Message>> _inbox = const {'next-turn': [], 'next-step': []};
   List<ChatItem>? _durable;
+  _DurableFold? _durableFold;
+  final List<SessionLogEvent> _durableTail = [];
+  bool? _derivedRunning;
   List<TurnTrace>? _traces;
   List<TurnTrace> _previousTraces = const [];
+  List<TurnTrace>? _completedTracePrefix;
   ({List<TodoItem>? todos})? _todos;
   ({GoalProjection? goal})? _goal;
   bool? _runningOverride;
@@ -199,20 +207,40 @@ class ChatTranscript {
   /// Whether a turn is in progress (Host status when known, else derived).
   bool get running {
     if (_runningOverride != null) return _runningOverride!;
+    if (_derivedRunning case final cached?) return cached;
     int? lastStart;
     int? lastEnd;
     for (final event in _log.values) {
       if (event is TurnStartedEvent) lastStart = event.seq;
       if (event is TurnEndedEvent) lastEnd = event.seq;
     }
-    return lastStart != null && (lastEnd == null || lastEnd < lastStart);
+    return _derivedRunning = lastStart != null && (lastEnd == null || lastEnd < lastStart);
   }
 
   Iterable<SessionLogEvent> get events => _log.values;
 
   /// Where each loaded turn's time went ([traceTurns] over the merged log).
   /// Finished turns keep their [TurnTrace] instance across later events.
-  List<TurnTrace> get turns => _traces ??= traceTurns(_log.values, reuse: _previousTraces);
+  List<TurnTrace> get turns => _traces ??= _buildTraces();
+
+  List<TurnTrace> _buildTraces() {
+    final prefix = _completedTracePrefix;
+    final traces = prefix == null || prefix.isEmpty
+        ? traceTurns(_log.values, reuse: _previousTraces)
+        : [...prefix, ...traceTurns(_traceEventsAfter(prefix.last.endSeq!), reuse: _previousTraces)];
+    // Own this list: callers may mutate the growable result returned by turns.
+    // An implicit interrupted turn has no endSeq and cannot bound a prefix.
+    _completedTracePrefix = traces.takeWhile((trace) => trace.endSeq != null).toList(growable: false);
+    return traces;
+  }
+
+  Iterable<SessionLogEvent> _traceEventsAfter(int boundary) sync* {
+    var seq = _log.firstKeyAfter(boundary);
+    while (seq != null) {
+      yield _log[seq]!;
+      seq = _log.firstKeyAfter(seq);
+    }
+  }
 
   /// The session's current todo list, as the Host's `todos` projection has
   /// it ([foldTodos]): the latest `todo/write`, cleared when the next turn
@@ -235,12 +263,26 @@ class ChatTranscript {
     return goal;
   }
 
-  void _logChanged() {
+  void _logChanged({SessionLogEvent? appended}) {
+    if (appended == null) {
+      _completedTracePrefix = null;
+      _durableFold = null;
+      _durableTail.clear();
+      _derivedRunning = null;
+    } else {
+      if (_durableFold != null) _durableTail.add(appended);
+      if (_derivedRunning != null) {
+        if (appended is TurnStartedEvent) _derivedRunning = true;
+        if (appended is TurnEndedEvent) _derivedRunning = false;
+      }
+    }
     _durable = null;
     if (_traces case final traces?) _previousTraces = traces;
     _traces = null;
-    _todos = null;
-    _goal = null;
+    // Only these appended events change the two projections. Snapshots,
+    // history and replacements still invalidate both through appended == null.
+    if (appended == null || appended is TodoWriteEvent || appended is TurnStartedEvent) _todos = null;
+    if (appended == null || appended.type == 'goal/change' || appended.type == 'user/message') _goal = null;
   }
 
   List<ChatItem> get items {
@@ -285,6 +327,9 @@ class ChatTranscript {
         _logChanged();
         return true;
       case SessionLogEvent():
+        // The follow cursor may exceed (or trail) the loaded log after snapshots.
+        final previousLast = _log.lastKey();
+        final appended = previousLast == null || event.seq > previousLast;
         final fresh = event.seq > cursor;
         _log[event.seq] = event;
         if (fresh) cursor = event.seq;
@@ -302,7 +347,7 @@ class ChatTranscript {
           default:
             break;
         }
-        _logChanged();
+        _logChanged(appended: appended ? event : null);
         return true;
       case AssistantStreamStarted():
         _drafts[event.attemptId] = _Draft(event.attemptId, event.turn, event.step, event.startedAfterSeq);
@@ -372,97 +417,20 @@ class ChatTranscript {
   }
 
   List<ChatItem> _build() {
-    // ChatItem or _ToolPlaceholder (resolved once all results are known).
-    final items = <Object>[];
-    final tools = <String, _ToolBuilder>{};
-    final approvalCalls = <String, String>{};
-    final messageKeys = <String>{};
-    final pendingByCall = {
-      for (final request in _approvals.values)
-        if (request.callId != null) request.callId!: request,
-    };
-
-    _ToolBuilder tool(String callId, String name, String arguments, int seq) {
-      return tools.putIfAbsent(callId, () {
-        final builder = _ToolBuilder(callId, name, arguments, seq);
-        items.add(_ToolPlaceholder(builder));
-        return builder;
-      });
-    }
-
-    for (final event in _log.values) {
-      switch (event) {
-        case UserMessageEvent(:final message):
-          if (!event.isHumanPrompt && !showSyntheticUserMessages) break;
-          items.add(
-            UserChatItem(
-              seq: event.seq,
-              time: event.time,
-              text: message.text,
-              images: message.parts.whereType<ImagePart>().map((p) => p.attachment).toList(),
-              files: message.parts.whereType<FilePart>().map((p) => p.attachment).toList(),
-              requestId: event.requestId,
-              sourceKind: message.source.kind,
-            ),
-          );
-        case AssistantMessageEvent(:final message):
-          if (message.text.trim().isNotEmpty || message.reasoning.trim().isNotEmpty || event.interrupted) {
-            final rowKey = 'm${event.turn}.${event.step}';
-            items.add(
-              AssistantChatItem(
-                id: 'a${event.seq}',
-                rowKey: messageKeys.add(rowKey) ? rowKey : null,
-                seq: event.seq,
-                time: event.time,
-                text: message.text,
-                reasoning: message.reasoning,
-                interrupted: event.interrupted,
-                usage: event.usage,
-                model: message.source.model,
-              ),
-            );
-          }
-          for (final call in message.toolCalls) {
-            tool(call.id, call.name, call.arguments, event.seq);
-          }
-        case ToolCallEvent():
-          tool(event.callId, event.name, event.arguments, event.seq).dispatched = true;
-        case ToolResultEvent():
-          final builder = tool(event.callId, 'tool', '', event.seq);
-          builder
-            ..result = event
-            ..dispatched = true;
-        case ApprovalAskedEvent(:final callId?):
-          approvalCalls[event.approvalId] = callId;
-          tools[callId]?.approvalAsked = true;
-        case ApprovalDecidedEvent():
-          final callId = approvalCalls[event.approvalId];
-          if (callId != null) tools[callId]?.approvalOutcome = event.outcome;
-        case TurnEndedEvent(:final reason):
-          for (final builder in tools.values) {
-            if (builder.result == null) builder.turnEnded = true;
-          }
-          final notice = _turnNotice(event.seq, reason);
-          if (notice != null) items.add(notice);
-        case LlmRetryEvent():
-          items.add(
-            NoticeChatItem(
-              seq: event.seq,
-              kind: 'retry',
-              text:
-                  'Retrying model request (${event.retry}${event.maxRetries == null ? '' : '/${event.maxRetries}'})'
-                  '${event.failure == null ? '' : ': ${event.failure!.message}'}',
-              failure: event.failure,
-            ),
-          );
-        default:
-          break;
+    var fold = _durableFold;
+    if (fold == null) {
+      fold = _DurableFold(showSyntheticUserMessages);
+      for (final event in _log.values) {
+        fold.apply(event);
+      }
+      _durableFold = fold;
+    } else {
+      for (final event in _durableTail) {
+        fold.apply(event);
       }
     }
-    return [
-      for (final item in items)
-        if (item is _ToolPlaceholder) item.builder.build(pendingByCall[item.builder.callId]) else item as ChatItem,
-    ];
+    _durableTail.clear();
+    return fold.build(_approvals.values);
   }
 
   static NoticeChatItem? _turnNotice(int seq, TurnEndReason reason) => switch (reason.kind) {
@@ -479,6 +447,112 @@ class ChatTranscript {
     'interrupted' => NoticeChatItem(seq: seq, kind: 'interrupted', text: 'Interrupted (Host restarted)'),
     _ => null,
   };
+}
+
+// Folded prefix of the log, extended by strictly appended events. Tools stay global:
+// late results and approvals can still update a row from an ended turn.
+class _DurableFold {
+  _DurableFold(this.showSyntheticUserMessages);
+
+  final bool showSyntheticUserMessages;
+  final items = <Object>[];
+  final tools = <String, _ToolBuilder>{};
+  final approvalCalls = <String, String>{};
+  final messageKeys = <String>{};
+  final unresolved = <_ToolBuilder>{};
+
+  _ToolBuilder tool(String callId, String name, String arguments, int seq) {
+    return tools.putIfAbsent(callId, () {
+      final builder = _ToolBuilder(callId, name, arguments, seq);
+      items.add(_ToolPlaceholder(builder));
+      unresolved.add(builder);
+      return builder;
+    });
+  }
+
+  void apply(SessionLogEvent event) {
+    switch (event) {
+      case UserMessageEvent(:final message):
+        if (!event.isHumanPrompt && !showSyntheticUserMessages) break;
+        items.add(
+          UserChatItem(
+            seq: event.seq,
+            time: event.time,
+            text: message.text,
+            images: message.parts.whereType<ImagePart>().map((p) => p.attachment).toList(),
+            files: message.parts.whereType<FilePart>().map((p) => p.attachment).toList(),
+            requestId: event.requestId,
+            sourceKind: message.source.kind,
+          ),
+        );
+      case AssistantMessageEvent(:final message):
+        if (message.text.trim().isNotEmpty || message.reasoning.trim().isNotEmpty || event.interrupted) {
+          final rowKey = 'm${event.turn}.${event.step}';
+          items.add(
+            AssistantChatItem(
+              id: 'a${event.seq}',
+              rowKey: messageKeys.add(rowKey) ? rowKey : null,
+              seq: event.seq,
+              time: event.time,
+              text: message.text,
+              reasoning: message.reasoning,
+              interrupted: event.interrupted,
+              isFinalAnswer: message.isFinalAnswer,
+              usage: event.usage,
+              model: message.source.model,
+            ),
+          );
+        }
+        for (final call in message.toolCalls) {
+          tool(call.id, call.name, call.arguments, event.seq);
+        }
+      case ToolCallEvent():
+        tool(event.callId, event.name, event.arguments, event.seq).dispatched = true;
+      case ToolResultEvent():
+        final builder = tool(event.callId, 'tool', '', event.seq);
+        unresolved.remove(builder);
+        builder
+          ..result = event
+          ..dispatched = true;
+      case ApprovalAskedEvent(:final callId?):
+        approvalCalls[event.approvalId] = callId;
+        tools[callId]?.approvalAsked = true;
+      case ApprovalDecidedEvent():
+        final callId = approvalCalls[event.approvalId];
+        if (callId != null) tools[callId]?.approvalOutcome = event.outcome;
+      case TurnEndedEvent(:final reason):
+        for (final builder in unresolved) {
+          builder.turnEnded = true;
+        }
+        unresolved.clear();
+        final notice = ChatTranscript._turnNotice(event.seq, reason);
+        if (notice != null) items.add(notice);
+      case LlmRetryEvent():
+        items.add(
+          NoticeChatItem(
+            seq: event.seq,
+            kind: 'retry',
+            text:
+                'Retrying model request (${event.retry}${event.maxRetries == null ? '' : '/${event.maxRetries}'})'
+                '${event.failure == null ? '' : ': ${event.failure!.message}'}',
+            failure: event.failure,
+          ),
+        );
+      default:
+        break;
+    }
+  }
+
+  List<ChatItem> build(Iterable<ApprovalRequest> approvals) {
+    final pendingByCall = {
+      for (final request in approvals)
+        if (request.callId != null) request.callId!: request,
+    };
+    return [
+      for (final item in items)
+        if (item is _ToolPlaceholder) item.builder.build(pendingByCall[item.builder.callId]) else item as ChatItem,
+    ];
+  }
 }
 
 class _ToolPlaceholder {
